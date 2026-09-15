@@ -1,119 +1,37 @@
-# Nexora Commerce Bot — v0.5 (FA README)
+# Nexora Commerce Bot — v0.6 Security Hardening
 
-یک ربات فروش محصولات دیجیتال فارسی برای تلگرام که روی **Cloudflare Workers + D1** اجرا می‌شود و برای فروشگاه، کیف اعتبار، پرداخت کریپتویی خودکار، کارت‌به‌کارت دستی، Referral، تیکت پشتیبانی و مدیریت کامل ساخته شده است.
+ربات فروش محصولات دیجیتال فارسی برای **Telegram + Cloudflare Workers + D1**. این نسخه روی v0.5 ساخته شده و مهاجرت آن **غیرتخریبی** است؛ دیتابیس، کاربران، سفارش‌ها، موجودی‌ها، تیکت‌ها و تنظیمات فعلی حفظ می‌شوند.
 
-> نام مستقل این پروژه **Nexora Commerce Bot** است.
+> این بسته برای بروزرسانی Repo فعلی طراحی شده است. فایل `wrangler.jsonc` فعلی خودت را که `database_id` واقعی D1 داخلش قرار داده‌ای نگه دار. در ZIP آپدیت عمداً `wrangler.jsonc` قرار داده نشده تا Binding دیتابیس فعلی‌ات خراب نشود.
 
-## امکانات اصلی
+## تغییرات امنیتی v0.6
 
-- رابط فارسی با Inline Keyboard
-- جوین اجباری چند کانال یا گروه
-- مدیریت کانال‌های جوین اجباری از داخل تلگرام
-- کیف Credit و Ledger کامل
-- خرید اعتبار با بسته‌های آماده یا مبلغ دلخواه
-- پرداخت خودکار **USDT BEP20** با Blockchain API
-- پرداخت خودکار **USDT TRC20** با Blockchain API
-- پرداخت خودکار **TON Native**
-- نرخ خودکار TON/USD با CoinGecko + حالت دستی جایگزین
-- پرداخت کارت‌به‌کارت با ارسال رسید و تأیید دستی ادمین
-- مبلغ یکتای Invoice برای Match بهتر پرداخت‌ها
-- اسکن خودکار تراکنش‌ها با Cron هر دقیقه
-- دکمه بررسی فوری «پرداخت کردم»
-- QR و Copy Address / Amount
-- فروشگاه دسته‌بندی‌شده
-- Stock Pool و تحویل خودکار محصولات
-- کد تخفیف درصدی و مبلغ ثابت
-- Refund سفارش به Credit
-- Referral و پاداش اعتبار
-- تاریخچه سفارش و پرداخت
-- تیکت پشتیبانی با متن، عکس و فایل
-- Broadcast صف‌دار
-- Audit Log ادمین
-- پنل مدیریت تلگرامی
-- **پنل مدیریت تحت وب**
-- جستجوی کاربران و اصلاح دستی موجودی
-- ویرایش کامل محصولات از Web Admin
-- ثبت هزینه تمام‌شده محصول و محاسبه سود
-- داشبورد فروش، هزینه و سود برای امروز / ۷ روز / ۳۰ روز / کل
-- Webhook Secret Token
-- Setup Secret مستقل برای ثبت Webhook
+- Webhook تلگرام **Fail-Closed** شده؛ بدون `WEBHOOK_SECRET` معتبر هیچ Update پذیرفته نمی‌شود.
+- Setup Webhook دیگر Secret را در URL نمی‌گیرد؛ `/setup-webhook` یک فرم POST امن دارد.
+- شناسه سفارش/فاکتور با `crypto.getRandomValues()` ساخته می‌شود و قابل حدس زدن نیست.
+- QR و Check Payment فقط برای **صاحب همان Invoice** کار می‌کنند.
+- Scanner پرداخت‌ها بر اساس **Network + Destination Wallet** گروه‌بندی می‌شود؛ تغییر Wallet باعث جا ماندن Invoice قدیمی نمی‌شود.
+- تراکنش Crypto باید بعد از زمان ایجاد Invoice باشد و حداقل تأیید معتبر داشته باشد.
+- خرید محصول، کسر Credit، رزرو Stock و مصرف Discount به شکل **Atomic** انجام می‌شود؛ خرید همزمان نمی‌تواند Stock یا Balance را دوبار خرج کند.
+- Refund نیز Atomic و idempotent شده است.
+- Stockهای جدید با **AES-GCM** در D1 رمز می‌شوند. Stockهای plaintext قدیمی پس از Deploy به‌صورت مرحله‌ای توسط Cron رمز می‌شوند.
+- پنل وب: Rate Limit ورود، Session قابل revoke، انقضای ۱۲ ساعته، CSRF Token، CSP، `X-Frame-Options`, `no-referrer`.
+- ورودی‌های حساس ادمین مثل Wallet، Join URL، Discount و Card validation شده‌اند.
+- `/health` دیگر نسخه و جزئیات Deployment را افشا نمی‌کند.
 
----
+## قبل از آپلود — فقط یک Secret جدید لازم است
 
-# معماری
+در Cloudflare → Worker → **Settings → Variables and Secrets** یک Secret جدید بساز:
 
 ```text
-Telegram
-   ↓
-Cloudflare Worker
-   ├── Telegram Webhook
-   ├── Shop / Stock / Discount Engine
-   ├── Credit Ledger
-   ├── Payment Engine
-   │    ├── Etherscan V2 → USDT BEP20
-   │    ├── TronGrid → USDT TRC20
-   │    └── TonAPI → TON transactions
-   ├── CoinGecko → TON/USD rate
-   ├── Card Receipt Manual Review
-   ├── Referral Engine
-   ├── Support Tickets
-   ├── Telegram Admin Panel
-   └── Web Admin Panel
-          ↓
-         D1
+STOCK_ENCRYPTION_KEY
 ```
 
-ربات برای دریافت پول به **Private Key یا Seed Phrase نیاز ندارد**. فقط آدرس عمومی Wallet را ذخیره می‌کند و تراکنش‌های عمومی Blockchain را بررسی می‌کند.
+مقدارش باید یک رشته تصادفی و پایدار حداقل 24 کاراکتری باشد؛ بهتر است 48 تا 64 کاراکتر باشد.
 
-> **هیچ‌وقت Seed Phrase یا Private Key خودت را داخل Worker، D1، Secret، GitHub یا سورس قرار نده.**
+**خیلی مهم:** بعد از اینکه Stockها با این کلید رمز شدند، این Secret را حذف یا عوض نکن. عوض کردن کلید بدون عملیات Key Rotation باعث می‌شود Stockهای قبلی قابل رمزگشایی نباشند.
 
----
-
-# نصب پیشنهادی: کاملاً ابری و بدون Node.js روی سیستم
-
-نسخه v0.5 برای این سناریو آماده شده است:
-
-```text
-GitHub → Cloudflare Workers Builds → Worker + D1
-```
-
-یعنی لازم نیست Node.js، npm یا Wrangler را روی کامپیوتر خودت نصب کنی. Cloudflare مستقیماً Repo را Build و Deploy می‌کند. Git integration رسمی Cloudflare با هر Push روی branch اصلی دوباره Deploy می‌کند.
-
-## مرحله 1 — ساخت Bot
-
-در `@BotFather` یک Bot بساز و `BOT_TOKEN` را نگه دار. Telegram ID ادمین را هم داشته باش.
-
-## مرحله 2 — آپلود پروژه در GitHub
-
-1. یک Repo جدید بساز؛ پیشنهاد: `nexora-telegram-commerce-bot`.
-2. فایل‌های همین پروژه را در ریشه Repo آپلود کن.
-3. `package.json` و `wrangler.jsonc` باید در ریشه Repo باشند.
-4. Commit کن.
-
-## مرحله 3 — اتصال GitHub به Cloudflare
-
-Cloudflare Dashboard → **Workers & Pages → Create application → Import a repository**.
-
-Repo را انتخاب کن و تنظیمات Build را این‌طور بگذار:
-
-```text
-Production branch: main
-Root directory: /
-Build command: [خالی]
-Deploy command: npm run deploy:cloudflare
-```
-
-سپس **Save and Deploy** را بزن.
-
-`wrangler.jsonc` در این نسخه عمداً D1 را فقط با binding `DB` تعریف کرده تا Wrangler جدید بتواند D1 را هنگام Deploy به‌صورت خودکار provision کند. اسکریپت `deploy:cloudflare` نیز بعد از Deploy، migrationهای دیتابیس را روی D1 Remote اعمال می‌کند.
-
-> اگر اولین Deploy فقط در مرحله migration شکست خورد، یک بار Retry Deployment بزن. در اولین مرحله Worker/D1 ساخته شده‌اند و Retry معمولاً migrationها را کامل می‌کند.
-
-## مرحله 4 — تنظیم Variables و Secrets در Cloudflare
-
-بعد از اولین Deploy برو به **Worker → Settings → Variables and Secrets**.
-
-### Secrets
+Secretهای اصلی Production باید حداقل این‌ها باشند:
 
 ```text
 BOT_TOKEN
@@ -121,127 +39,139 @@ WEBHOOK_SECRET
 SETUP_SECRET
 ADMIN_WEB_PASSWORD
 ADMIN_SESSION_SECRET
-ETHERSCAN_API_KEY      (در صورت BEP20)
-TRONGRID_API_KEY       (در صورت TRC20)
-TONAPI_API_KEY         (در صورت TON)
+STOCK_ENCRYPTION_KEY
 ```
 
-### Variables
+و بسته به شبکه‌های فعال:
 
 ```text
-BOT_USERNAME
-ADMIN_IDS
-PUBLIC_BASE_URL
-USDT_BEP20_WALLET
-USDT_BEP20_TOKEN
-USDT_TRC20_WALLET
-USDT_TRC20_TOKEN
-TON_WALLET
-TON_USD_RATE
-ETHERSCAN_CHAIN_ID
-CARD_NUMBER
-CARD_HOLDER
-CREDIT_USD_PRICE
-REFERRAL_REWARD
-INVOICE_EXPIRE_MINUTES
+ETHERSCAN_API_KEY
+TRONGRID_API_KEY
+TONAPI_API_KEY
 ```
 
-مقادیر پیشنهادی ثابت:
+## آپدیت v0.5 → v0.6 فقط با GitHub و Cloudflare
+
+1. از Repo فعلی GitHub یک Backup/branch بگیر.
+2. **`wrangler.jsonc` فعلی را دست نزن**؛ همان فایلی که `database_name` و `database_id` واقعی D1 تو را دارد بماند.
+3. محتوای ZIP آپدیت v0.6 را روی Root همان Repo آپلود و Replace کن.
+4. مطمئن شو فایل جدید زیر داخل Repo آمده:
 
 ```text
-USDT_BEP20_TOKEN = 0x55d398326f99059fF775485246999027B3197955
-USDT_TRC20_TOKEN = TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
-ETHERSCAN_CHAIN_ID = 56
-CREDIT_USD_PRICE = 1
-REFERRAL_REWARD = 0.05
-INVOICE_EXPIRE_MINUTES = 30
+migrations/0005_security_hardening.sql
 ```
 
-`PUBLIC_BASE_URL` باید URL واقعی Worker باشد، مثلاً:
+5. در Cloudflare Secret جدید `STOCK_ENCRYPTION_KEY` را اضافه کن.
+6. Commit به branch اصلی (`main`) بزن.
+7. Cloudflare Workers Builds به‌صورت خودکار این دستور موجود در پروژه را اجرا می‌کند:
 
 ```text
-https://nexora-commerce-bot.YOURSUBDOMAIN.workers.dev
+npm run deploy:cloudflare
 ```
 
-برای غیرفعال کردن یک روش Crypto، Wallet همان روش را خالی بگذار.
-
-بعد از Save کردن Variables/Secrets یک Redeploy انجام بده.
-
-## مرحله 5 — ثبت Webhook فقط با مرورگر
-
-آدرس زیر را باز کن:
+که Worker را Deploy و سپس migrationهای unapplied را روی D1 Remote اجرا می‌کند.
+8. در Build log باید اجرای `0005_security_hardening.sql` بدون Error تمام شود.
+9. آدرس زیر را باز کن:
 
 ```text
-https://YOUR-WORKER.workers.dev/setup-webhook?secret=YOUR_SETUP_SECRET
+https://YOUR-DOMAIN/health
 ```
 
-اگر پاسخ شامل `"ok": true` بود، Webhook تلگرام فعال است.
+خروجی صحیح:
 
-## مرحله 6 — تست
+```json
+{"ok":true}
+```
 
-Health:
+## تنظیم Webhook در v0.6
+
+روش قدیمی زیر دیگر استفاده نمی‌شود:
 
 ```text
-https://YOUR-WORKER.workers.dev/health
+/setup-webhook?secret=...
 ```
 
-Web Admin:
+حالا فقط این آدرس را در مرورگر باز کن:
 
 ```text
-https://YOUR-WORKER.workers.dev/admin-web
+https://YOUR-DOMAIN/setup-webhook
 ```
 
-سپس در Telegram دستور `/start` را بزن.
+فرم باز می‌شود. مقدار `SETUP_SECRET` را داخل فرم وارد کن و Submit بزن. Secret دیگر در URL، History یا Referrer قرار نمی‌گیرد.
 
-## مرحله 7 — Deployهای آینده
+اگر موفق باشد Telegram پاسخ `ok: true` می‌دهد.
 
-از این به بعد فقط GitHub را تغییر بده. هر Commit روی `main` باعث Build و Deploy خودکار Cloudflare می‌شود؛ Migrationهای جدید D1 نیز همان‌جا اجرا می‌شوند.
+## تست بعد از آپدیت
 
-برای راهنمای دقیق‌تر تصویری/قدم‌به‌قدم فایل زیر را ببین:
+این موارد را به‌ترتیب تست کن:
+
+1. `/start` در بات.
+2. جوین اجباری.
+3. Balance.
+4. ساخت یک فاکتور Crypto بدون پرداخت واقعی و Cancel کردن آن.
+5. کارت‌به‌کارت و ارسال رسید تستی؛ ادمین باید Approval/Reject ببیند.
+6. ورود به `/admin-web`.
+7. پنج بار رمز اشتباه نزن؛ سیستم بعد از چند تلاش ناموفق IP را موقتاً محدود می‌کند.
+8. یک Stock تستی از Telegram Admin اضافه کن؛ از این نسخه به بعد در D1 به صورت encrypted ذخیره می‌شود.
+9. یک خرید کم‌ارزش تستی انجام بده و تحویل Stock را چک کن.
+10. Discount و Refund را تست کن.
+
+## رفتار Stockهای قدیمی
+
+Stockهای قبلی حذف یا تغییر ناگهانی نمی‌شوند. Cron هر دقیقه تعداد محدودی Stock plaintext و `available` را با `STOCK_ENCRYPTION_KEY` رمز می‌کند. در طول این مهاجرت ربات همچنان می‌تواند آن‌ها را بخواند. Stockهای جدید از لحظه ثبت رمز می‌شوند.
+
+## پنل وب ادمین
 
 ```text
-docs/CLOUDFLARE_GIT_DEPLOY_FA.md
+https://YOUR-DOMAIN/admin-web
 ```
 
----
+در v0.6:
 
-# پرداخت‌ها
+- Session حداکثر 12 ساعت است.
+- Logout واقعاً Session را از D1 revoke می‌کند.
+- POSTهای پنل CSRF-protected هستند.
+- بعد از تلاش‌های ناموفق متعدد، Login موقتاً Block می‌شود.
 
-## USDT BEP20
-پول مستقیم به `USDT_BEP20_WALLET` می‌رود و Worker از Blockchain API برای Match تراکنش استفاده می‌کند. Private Key لازم نیست.
+## پرداخت Crypto
 
-## USDT TRC20
-آدرس شخصی TRON خودت را در `USDT_TRC20_WALLET` قرار بده. اسکن تراکنش از API انجام می‌شود.
+منطق کلید خصوصی ندارد و فقط Blockchain API را می‌خواند. Seed Phrase یا Private Key را هرگز داخل Worker، GitHub یا D1 قرار نده.
 
-## TON
-`TON_WALLET` آدرس دریافت است. نرخ TON/USD در حالت Auto از CoinGecko بروزرسانی می‌شود و مقدار `TON_USD_RATE` فقط fallback دستی است.
+Invoice matching بر اساس شبکه، مقصد، مقدار دقیق، زمان ایجاد Invoice و Transaction Hash انجام می‌شود. `tx_hash` برای Invoiceهای پرداخت‌شده unique شده تا یک تراکنش دوبار مصرف نشود.
 
 ## کارت‌به‌کارت
-`CARD_NUMBER` و `CARD_HOLDER` را تنظیم کن. کاربر رسید می‌فرستد و ادمین داخل Telegram به‌صورت دستی تأیید یا رد می‌کند.
 
----
+کارت‌به‌کارت همچنان Manual Review است:
 
-# امنیت
+`Invoice → Receipt → Admin Review → Approve/Reject → Credit`
 
-- Seed Phrase و Private Key هرگز وارد پروژه نمی‌شود.
-- Token/API Key/رمزها را در GitHub قرار نده.
-- `WEBHOOK_SECRET`، `SETUP_SECRET` و `ADMIN_SESSION_SECRET` را رشته تصادفی قوی انتخاب کن.
-- برای کانال‌های Join اجباری، Bot باید در آن کانال Admin باشد تا بررسی عضویت قابل اتکا باشد.
-- فایل `wrangler.jsonc` در v0.5 عمداً فاقد اطلاعات شخصی و Secret است.
+Approval به‌صورت guard شده انجام می‌شود تا همان Invoice دوبار Credit نشود.
 
----
-
-# ساختار مهم پروژه
+## فایل‌های مهم v0.6
 
 ```text
-src/index.ts                     Worker اصلی
-migrations/                      D1 migrations
-wrangler.jsonc                   تنظیم Worker و D1 binding
-package.json                     دستورات Build/Deploy
-README_FA.md                     راهنمای اصلی فارسی
-docs/CLOUDFLARE_GIT_DEPLOY_FA.md راهنمای GitHub → Cloudflare
+src/index.ts
+migrations/0005_security_hardening.sql
+package.json
+README_FA.md
+README.md
+docs/SECURITY_V06_FA.md
 ```
 
-# ارتقا از v0.4
+فایل `wrangler.jsonc` در **بسته Upgrade** وجود ندارد؛ از Repo فعلی خودت نگهش دار تا `database_id` شخصی D1 پاک نشود.
 
-اگر قبلاً v0.4 را Deploy کرده‌ای، اتصال Git را روی همین Repo فعال کن و Deploy command را `npm run deploy:cloudflare` بگذار. D1 موجود باید به binding `DB` Worker وصل باشد. قبل از جایگزینی config روی پروژه Production، از D1 Backup بگیر.
+## نکات Production
+
+- Repo را Public نکن اگر هر Secret یا اطلاعات واقعی داخلش Commit کرده‌ای.
+- Secretها فقط در Cloudflare Variables and Secrets باشند.
+- `WEBHOOK_SECRET`, `SETUP_SECRET`, `ADMIN_SESSION_SECRET`, `STOCK_ENCRYPTION_KEY` همگی باید با هم متفاوت باشند.
+- `ADMIN_WEB_PASSWORD` یک Password طولانی و یکتا باشد.
+- برای Admin Web در مرحله بعد می‌توان Cloudflare Access را هم جلوی `/admin-web` قرار داد؛ v0.6 بدون آن هم Rate Limit و Session/CSRF دارد.
+
+## Upgrade database
+
+Migration جدید فقط جدول‌ها/Indexهای امنیتی را اضافه می‌کند. Migrationهای قبلی دوباره اجرا نمی‌شوند چون D1 جدول migration history دارد. اگر migration جدید خطا بدهد، Cloudflare D1 همان migration ناموفق را rollback می‌کند و migrationهای قبلی دست‌نخورده می‌مانند.
+
+---
+
+Version: **0.6.0**
