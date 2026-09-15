@@ -1,13 +1,17 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "nexora-commerce-bot",
+  "name": "nexora-telegram-commerce-bot",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-01",
+
   "d1_databases": [
     {
-      "binding": "DB"
+      "binding": "DB",
+      "database_name": "nexora-commerce-bot-db",
+      "database_id": "eb116205-7e2d-41ce-95c1-630618d8209a"
     }
   ],
+
   "triggers": {
     "crons": ["* * * * *"]
   }
