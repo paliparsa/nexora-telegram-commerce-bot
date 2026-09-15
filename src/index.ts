@@ -1,0 +1,843 @@
+export interface Env {
+  DB: D1Database;
+  BOT_TOKEN: string;
+  ETHERSCAN_API_KEY?: string;
+  TRONGRID_API_KEY?: string;
+  TONAPI_API_KEY?: string;
+  BOT_USERNAME: string;
+  ADMIN_IDS: string;
+  PUBLIC_BASE_URL: string;
+  WEBHOOK_SECRET?: string;
+  USDT_BEP20_WALLET: string;
+  USDT_BEP20_TOKEN: string;
+  USDT_TRC20_WALLET?: string;
+  USDT_TRC20_TOKEN?: string;
+  TON_WALLET?: string;
+  TON_USD_RATE?: string;
+  ETHERSCAN_CHAIN_ID: string;
+  CARD_NUMBER: string;
+  CARD_HOLDER: string;
+  CREDIT_USD_PRICE: string;
+  REFERRAL_REWARD: string;
+  INVOICE_EXPIRE_MINUTES: string;
+  ADMIN_WEB_PASSWORD?: string;
+  ADMIN_SESSION_SECRET?: string;
+  SETUP_SECRET?: string;
+}
+
+type TgUser = { id:number; username?:string; first_name?:string };
+type Chat = { id:number };
+type Photo = { file_id:string };
+type Document = { file_id:string; file_name?:string };
+type Message = { message_id:number; chat:Chat; from?:TgUser; text?:string; caption?:string; photo?:Photo[]; document?:Document };
+type CallbackQuery = { id:string; from:TgUser; message?:Message; data?:string };
+type Update = { message?:Message; callback_query?:CallbackQuery };
+type CopyTextButton = { text:string };
+type Btn = { text:string; callback_data?:string; url?:string; copy_text?:CopyTextButton };
+
+const j=(x:any,status=200)=>new Response(JSON.stringify(x),{status,headers:{'content-type':'application/json; charset=utf-8'}});
+const esc=(s:string='')=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c] as string));
+const nowIso=()=>new Date().toISOString();
+const publicId=(p:string)=>`${p}${Date.now().toString().slice(-8)}${Math.floor(Math.random()*900+100)}`;
+const admins=(env:Env)=>new Set((env.ADMIN_IDS||'').split(',').map(x=>Number(x.trim())).filter(Boolean));
+const isAdmin=(env:Env,id:number)=>admins(env).has(id);
+
+async function tg(env:Env,method:string,body:any){
+  const r=await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+  const data:any=await r.json();
+  if(!data.ok) console.log('TG error',method,data);
+  return data;
+}
+async function send(env:Env,chat_id:number,text:string,rows:Btn[][]=[]){
+  return tg(env,'sendMessage',{chat_id,text,parse_mode:'HTML',disable_web_page_preview:true,reply_markup:{inline_keyboard:rows}});
+}
+async function edit(env:Env,chat_id:number,message_id:number,text:string,rows:Btn[][]=[]){
+  return tg(env,'editMessageText',{chat_id,message_id,text,parse_mode:'HTML',disable_web_page_preview:true,reply_markup:{inline_keyboard:rows}});
+}
+async function answerCb(env:Env,id:string,text?:string,show_alert=false){
+  if(!id) return;
+  return tg(env,'answerCallbackQuery',{callback_query_id:id,text,show_alert});
+}
+async function logAdmin(env:Env,adminId:number,action:string,refType?:string,refId?:string,details?:string){
+  await env.DB.prepare('INSERT INTO admin_logs(admin_telegram_id,action,ref_type,ref_id,details) VALUES(?,?,?,?,?)').bind(adminId,action,refType||null,refId||null,details||null).run();
+}
+
+async function upsertUser(env:Env,u:TgUser,startParam?:string){
+  const old:any=await env.DB.prepare('SELECT * FROM users WHERE telegram_id=?').bind(u.id).first();
+  if(!old){
+    let inviter:number|null=null;
+    if(startParam?.startsWith('ref_')){
+      const n=Number(startParam.slice(4)); if(Number.isFinite(n)&&n!==u.id) inviter=n;
+    }
+    await env.DB.prepare('INSERT INTO users(telegram_id,username,first_name,inviter_telegram_id) VALUES(?,?,?,?)').bind(u.id,u.username||null,u.first_name||null,inviter).run();
+    if(inviter){
+      await env.DB.prepare("INSERT OR IGNORE INTO referrals(inviter_telegram_id,invitee_telegram_id,status,reward) VALUES(?,?,'pending',?)").bind(inviter,u.id,Number(env.REFERRAL_REWARD||0.05)).run();
+    }
+  } else {
+    await env.DB.prepare('UPDATE users SET username=?,first_name=?,updated_at=CURRENT_TIMESTAMP WHERE telegram_id=?').bind(u.username||null,u.first_name||null,u.id).run();
+  }
+}
+
+async function requiredChannels(env:Env){
+  const q:any=await env.DB.prepare('SELECT * FROM required_channels WHERE enabled=1 ORDER BY sort_order,id').all(); return q.results||[];
+}
+async function checkJoin(env:Env,uid:number){
+  const missing:any[]=[];
+  for(const c of await requiredChannels(env)){
+    try{
+      const r=await tg(env,'getChatMember',{chat_id:c.chat_id,user_id:uid});
+      const st=r.result?.status;
+      if(!r.ok||!['creator','administrator','member','restricted'].includes(st)) missing.push(c);
+    }catch{missing.push(c)}
+  }
+  return missing;
+}
+async function joinGate(env:Env,uid:number,chat:number,messageId?:number){
+  const missing=await checkJoin(env,uid);
+  if(!missing.length){
+    await env.DB.prepare('UPDATE users SET join_verified=1 WHERE telegram_id=?').bind(uid).run();
+    await qualifyReferral(env,uid);
+    return false;
+  }
+  const rows:Btn[][]=missing.map((c:any)=>[{text:`📢 عضویت در ${c.title}`,url:c.join_url}]);
+  rows.push([{text:'✅ عضو شدم؛ بررسی عضویت',callback_data:'join:check'}]);
+  const t='🔒 <b>عضویت الزامی</b>\n\nبرای استفاده از ربات ابتدا در کانال‌های زیر عضو شو و سپس روی «بررسی عضویت» بزن.';
+  if(messageId) await edit(env,chat,messageId,t,rows); else await send(env,chat,t,rows);
+  return true;
+}
+async function qualifyReferral(env:Env,invitee:number){
+  const r:any=await env.DB.prepare("SELECT * FROM referrals WHERE invitee_telegram_id=? AND status='pending'").bind(invitee).first();
+  if(!r)return;
+  const u:any=await env.DB.prepare('SELECT join_verified FROM users WHERE telegram_id=?').bind(invitee).first();
+  if(!u?.join_verified)return;
+  await env.DB.batch([
+    env.DB.prepare("UPDATE referrals SET status='rewarded',rewarded_at=CURRENT_TIMESTAMP WHERE id=?").bind(r.id),
+    env.DB.prepare("INSERT INTO credit_ledger(telegram_id,amount,kind,ref_type,ref_id,note) VALUES(?,?,'referral','referral',?,'پاداش معرفی کاربر')").bind(r.inviter_telegram_id,r.reward,String(r.id))
+  ]);
+}
+async function balance(env:Env,uid:number){
+  const r:any=await env.DB.prepare("SELECT COALESCE(SUM(amount),0) total,COALESCE(SUM(CASE WHEN kind='referral' THEN amount ELSE 0 END),0) referral FROM credit_ledger WHERE telegram_id=?").bind(uid).first();
+  return {total:Number(r?.total||0),referral:Number(r?.referral||0),topup:Number(r?.total||0)-Number(r?.referral||0)};
+}
+
+function menu():Btn[][]{return [
+  [{text:'🛍 فروشگاه',callback_data:'shop:list'}],
+  [{text:'💳 خرید اعتبار',callback_data:'credit:buy'},{text:'💰 موجودی',callback_data:'balance'}],
+  [{text:'📜 تاریخچه',callback_data:'history:menu'},{text:'🎁 دعوت و درآمد',callback_data:'referral'}],
+  [{text:'🟢 وضعیت سرویس',callback_data:'status'},{text:'🆘 پشتیبانی',callback_data:'support:menu'}]
+]}
+async function showMenu(env:Env,chat:number,messageId?:number){
+  const t='👋 <b>به ربات خوش اومدی!</b>\n\nاز اینجا می‌تونی اعتبار بخری، محصولات دیجیتال تهیه کنی، سفارش‌هات رو ببینی و از دعوت دوستان درآمد بگیری.';
+  if(messageId)await edit(env,chat,messageId,t,menu()); else await send(env,chat,t,menu());
+}
+async function showBalance(env:Env,uid:number,chat:number,mid?:number){
+  const b=await balance(env,uid);
+  const t=`💰 <b>موجودی حساب</b>\n\n💳 اعتبار خریداری‌شده: <b>${b.topup.toFixed(2)}</b>\n🎁 اعتبار دعوت: <b>${b.referral.toFixed(2)}</b>\n━━━━━━━━━━\n💎 مجموع: <b>${b.total.toFixed(2)} Credit</b>`;
+  const rows=[[{text:'💳 خرید اعتبار',callback_data:'credit:buy'},{text:'🏠 منوی اصلی',callback_data:'menu'}]];
+  mid?await edit(env,chat,mid,t,rows):await send(env,chat,t,rows);
+}
+
+async function showCreditPackages(env:Env,chat:number,mid?:number){
+  const q:any=await env.DB.prepare('SELECT * FROM credit_packages WHERE enabled=1 ORDER BY sort_order,id').all();
+  const rows:Btn[][]=(q.results||[]).map((p:any)=>[{text:p.title,callback_data:`credit:pkg:${p.id}`}]);
+  rows.push([{text:'✏️ مقدار دلخواه',callback_data:'credit:custom'}],[{text:'⬅️ بازگشت',callback_data:'menu'}]);
+  const t='💳 <b>خرید اعتبار</b>\n\nهر 1 Credit برای خرید محصولات داخل ربات قابل استفاده است.\n\nیکی از بسته‌ها را انتخاب کن:';
+  mid?await edit(env,chat,mid,t,rows):await send(env,chat,t,rows);
+}
+async function getSetting(env:Env,key:string,fallback=''){
+  const r:any=await env.DB.prepare('SELECT value FROM bot_settings WHERE key=?').bind(key).first();
+  if(r&&r.value!==null&&r.value!==undefined)return String(r.value);
+  return String(fallback||'');
+}
+async function setSetting(env:Env,key:string,value:string){
+  await env.DB.prepare('INSERT INTO bot_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').bind(key,value).run();
+}
+async function refreshTonRate(env:Env,force=false){
+  const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase();
+  if(mode!=='auto'&&!force)return null;
+  const lastRaw=await getSetting(env,'ton_usd_rate_updated_at','');
+  const last=lastRaw?Date.parse(lastRaw):0;
+  if(!force&&last&&Date.now()-last<10*60*1000){
+    const cached=Number(await getSetting(env,'ton_usd_rate_auto','0'))||0;
+    return cached||null;
+  }
+  try{
+    const r=await fetch('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',{headers:{'accept':'application/json','user-agent':'Nexora-Commerce-Bot/0.5'}});
+    if(!r.ok)throw new Error(`rate_http_${r.status}`);
+    const data:any=await r.json(); const rate=Number(data?.['the-open-network']?.usd||0);
+    if(!Number.isFinite(rate)||rate<=0)throw new Error('invalid_rate');
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('ton_usd_rate_auto',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(String(rate)),
+      env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('ton_usd_rate_updated_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(nowIso())
+    ]);
+    return rate;
+  }catch(e){console.log('TON rate refresh failed',String(e));return null;}
+}
+async function effectiveTonRate(env:Env){
+  const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase();
+  const manual=Number(await getSetting(env,'ton_usd_rate',env.TON_USD_RATE||'0'))||0;
+  if(mode==='manual')return manual;
+  const auto=Number(await getSetting(env,'ton_usd_rate_auto','0'))||0;
+  if(auto>0)return auto;
+  const fresh=await refreshTonRate(env,true); return fresh||manual;
+}
+async function paymentConfig(env:Env){
+  return {
+    bep20: await getSetting(env,'wallet_bep20',env.USDT_BEP20_WALLET||''),
+    trc20: await getSetting(env,'wallet_trc20',env.USDT_TRC20_WALLET||''),
+    ton: await getSetting(env,'wallet_ton',env.TON_WALLET||''),
+    tonRate: await effectiveTonRate(env),
+    card: await getSetting(env,'card_number',env.CARD_NUMBER||''),
+    cardHolder: await getSetting(env,'card_holder',env.CARD_HOLDER||'')
+  };
+}
+async function paymentMethods(env:Env,chat:number,mid:number,usd:number,credits:number){
+  const token=`${usd}:${credits}`; const cfg=await paymentConfig(env); const rows:Btn[][]=[];
+  if(cfg.bep20)rows.push([{text:'🟡 USDT (BEP20) — خودکار',callback_data:`pay:crypto:BEP20:${token}`}]);
+  if(cfg.trc20)rows.push([{text:'🔴 USDT (TRC20) — خودکار',callback_data:`pay:crypto:TRC20:${token}`}]);
+  if(cfg.ton&&cfg.tonRate>0)rows.push([{text:'💎 TON — خودکار',callback_data:`pay:crypto:TON:${token}`}]);
+  if(cfg.card)rows.push([{text:'🏦 کارت به کارت — تأیید دستی',callback_data:`pay:card:${token}`}]);
+  rows.push([{text:'⬅️ بازگشت',callback_data:'credit:buy'}]);
+  await edit(env,chat,mid,`💳 <b>انتخاب روش پرداخت</b>\n\n💵 مبلغ: <b>$${usd.toFixed(2)}</b>\n💎 اعتبار دریافتی: <b>${credits.toFixed(2)}</b>`,rows);
+}
+async function createCryptoInvoice(env:Env,uid:number,usd:number,credits:number,network:string){
+  const cfg=await paymentConfig(env); const net=network.toUpperCase();
+  let asset='USDT', destination='', base=usd, precision=3;
+  if(net==='BEP20')destination=cfg.bep20;
+  else if(net==='TRC20')destination=cfg.trc20;
+  else if(net==='TON'){destination=cfg.ton;asset='TON'; if(cfg.tonRate<=0)throw new Error('TON rate is not configured'); base=usd/cfg.tonRate; precision=4;}
+  else throw new Error('Unsupported network');
+  if(!destination)throw new Error('Wallet is not configured');
+  let expected=0;
+  for(let i=0;i<20;i++){
+    const salt=net==='TON'?(Math.floor(Math.random()*8999)+1000)/100000:(Math.floor(Math.random()*899)+100)/1000;
+    expected=Number((base+salt).toFixed(precision));
+    const dup:any=await env.DB.prepare("SELECT id FROM payment_invoices WHERE method='crypto' AND network=? AND asset=? AND status='pending' AND expected_amount=? AND datetime(expires_at)>datetime('now')").bind(net,asset,expected).first();
+    if(!dup)break;
+  }
+  const id=publicId('P'); const exp=new Date(Date.now()+Number(env.INVOICE_EXPIRE_MINUTES||30)*60000).toISOString();
+  await env.DB.prepare("INSERT INTO payment_invoices(public_id,telegram_id,method,network,asset,requested_usd,credit_amount,expected_amount,destination,status,expires_at) VALUES(?,?,'crypto',?,?,?,?,?,?, 'pending',?)")
+    .bind(id,uid,net,asset,usd,credits,expected,destination,exp).run();
+  return {id,expected,exp,network:net,asset,destination,precision};
+}
+async function createCardInvoice(env:Env,uid:number,usd:number,credits:number){
+  const id=publicId('C'); const exp=new Date(Date.now()+60*60000).toISOString();
+  await env.DB.prepare("INSERT INTO payment_invoices(public_id,telegram_id,method,requested_usd,credit_amount,status,expires_at) VALUES(?,?,'card',?,?,'awaiting_receipt',?)").bind(id,uid,usd,credits,exp).run();
+  await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`await_card_receipt:${id}`,uid).run();
+  return {id,exp};
+}
+async function showCryptoInvoice(env:Env,chat:number,mid:number,uid:number,usd:number,credits:number,network:string){
+  let inv:any; try{inv=await createCryptoInvoice(env,uid,usd,credits,network);}catch(e:any){return edit(env,chat,mid,`❌ روش پرداخت آماده نیست.\n\n${esc(String(e?.message||e))}`,[[{text:'⬅️ بازگشت',callback_data:'credit:buy'}]]);}
+  const netLabel=inv.network==='BEP20'?'BSC / BEP20':inv.network==='TRC20'?'TRON / TRC20':'TON';
+  const emoji=inv.network==='BEP20'?'🟡':inv.network==='TRC20'?'🔴':'💎';
+  const amount=Number(inv.expected).toFixed(inv.precision);
+  const t=`${emoji} <b>پرداخت ${inv.asset} روی ${inv.network}</b>\n\n🧾 فاکتور: <code>${inv.id}</code>\n💵 ارزش سفارش: $${usd.toFixed(2)}\n💰 <b>مبلغ دقیق قابل ارسال: ${amount} ${inv.asset}</b>\n\n🌐 شبکه: <b>${netLabel}</b>\n📬 آدرس مقصد:\n<code>${esc(inv.destination)}</code>\n\n⚠️ مبلغ را دقیق بفرست و فقط از شبکه مشخص‌شده استفاده کن.\n⏱ فاکتور حدود ${env.INVOICE_EXPIRE_MINUTES||30} دقیقه اعتبار دارد.\n\nسیستم به‌صورت خودکار بلاکچین را بررسی می‌کند.`;
+  await edit(env,chat,mid,t,[
+    [{text:'📋 کپی آدرس',copy_text:{text:inv.destination}},{text:'📋 کپی مبلغ',copy_text:{text:amount}}],
+    [{text:'📷 نمایش QR',callback_data:`pay:qr:${inv.id}`}],
+    [{text:'✨ پرداخت کردم؛ بررسی کن',callback_data:`pay:check:${inv.id}`}],
+    [{text:'❌ لغو فاکتور',callback_data:`pay:cancel:${inv.id}`}],[{text:'🏠 منوی اصلی',callback_data:'menu'}]
+  ]);
+}
+async function showPaymentQr(env:Env,chat:number,pub:string){
+  const inv:any=await env.DB.prepare("SELECT * FROM payment_invoices WHERE public_id=? AND method='crypto'").bind(pub).first(); if(!inv)return;
+  const payload=encodeURIComponent(String(inv.destination)); const url=`https://quickchart.io/qr?text=${payload}&size=350`;
+  const precision=inv.network==='TON'?4:3;
+  await tg(env,'sendPhoto',{chat_id:chat,photo:url,caption:`📷 QR آدرس ${inv.network}\n\nفاکتور: ${pub}\nمبلغ دقیق: ${Number(inv.expected_amount).toFixed(precision)} ${inv.asset}\n\n⚠️ QR فقط آدرس را نشان می‌دهد؛ مبلغ را دقیق و جداگانه وارد کن.`});
+}
+async function showCardInvoice(env:Env,chat:number,mid:number,uid:number,usd:number,credits:number){
+  const inv=await createCardInvoice(env,uid,usd,credits); const cfg=await paymentConfig(env);
+  const t=`🏦 <b>کارت به کارت</b>\n\n🧾 فاکتور: <code>${inv.id}</code>\n💵 مبلغ معادل دلاری: <b>$${usd.toFixed(2)}</b>\n💎 اعتبار: <b>${credits.toFixed(2)}</b>\n\n💳 شماره کارت:\n<code>${esc(cfg.card)}</code>\n👤 به نام: <b>${esc(cfg.cardHolder)}</b>\n\nپس از واریز، <b>تصویر یا فایل رسید</b> را همین‌جا ارسال کن. سفارش برای ادمین می‌رود و پس از تأیید دستی اعتبارت اضافه می‌شود.`;
+  await edit(env,chat,mid,t,[[{text:'📋 کپی شماره کارت',copy_text:{text:cfg.card}}],[{text:'❌ لغو',callback_data:`pay:cancel:${inv.id}`}],[{text:'🏠 منوی اصلی',callback_data:'menu'}]]);
+}
+
+type ChainTransfer={hash:string;to:string;amount:number;ts:number;ok:boolean};
+async function fetchBep20Transfers(env:Env,wallet:string):Promise<ChainTransfer[]>{
+  if(!env.ETHERSCAN_API_KEY||!wallet)return [];
+  const u=new URL('https://api.etherscan.io/v2/api'); u.searchParams.set('chainid',env.ETHERSCAN_CHAIN_ID||'56'); u.searchParams.set('module','account'); u.searchParams.set('action','tokentx');
+  u.searchParams.set('contractaddress',env.USDT_BEP20_TOKEN); u.searchParams.set('address',wallet); u.searchParams.set('page','1'); u.searchParams.set('offset','150'); u.searchParams.set('sort','desc'); u.searchParams.set('apikey',env.ETHERSCAN_API_KEY);
+  try{const r=await fetch(u.toString()); const d:any=await r.json(); const arr=Array.isArray(d.result)?d.result:[]; return arr.map((x:any)=>({hash:String(x.hash||''),to:String(x.to||''),amount:Number(x.value)/10**Number(x.tokenDecimal||18),ts:Number(x.timeStamp||0)*1000,ok:String(x.isError||'0')!=='1'}));}catch{return []}
+}
+async function fetchTrc20Transfers(env:Env,wallet:string):Promise<ChainTransfer[]>{
+  if(!wallet||!env.USDT_TRC20_TOKEN)return [];
+  const u=new URL(`https://api.trongrid.io/v1/accounts/${encodeURIComponent(wallet)}/transactions/trc20`); u.searchParams.set('only_confirmed','true');u.searchParams.set('limit','200');u.searchParams.set('contract_address',env.USDT_TRC20_TOKEN);
+  const headers:any={}; if(env.TRONGRID_API_KEY)headers['TRON-PRO-API-KEY']=env.TRONGRID_API_KEY;
+  try{const r=await fetch(u.toString(),{headers});const d:any=await r.json();return (Array.isArray(d.data)?d.data:[]).map((x:any)=>({hash:String(x.transaction_id||''),to:String(x.to||''),amount:Number(x.value)/10**Number(x.token_info?.decimals||6),ts:Number(x.block_timestamp||0),ok:true}));}catch{return []}
+}
+async function fetchTonTransfers(env:Env,wallet:string):Promise<ChainTransfer[]>{
+  if(!wallet)return [];
+  const headers:any={accept:'application/json'}; if(env.TONAPI_API_KEY)headers.Authorization=`Bearer ${env.TONAPI_API_KEY}`;
+  try{
+    let normalized=wallet; const ar=await fetch(`https://tonapi.io/v2/accounts/${encodeURIComponent(wallet)}`,{headers}); if(ar.ok){const ad:any=await ar.json();normalized=String(ad.address||wallet);}
+    const r=await fetch(`https://tonapi.io/v2/accounts/${encodeURIComponent(wallet)}/events?limit=100`,{headers});const d:any=await r.json();const out:ChainTransfer[]=[];
+    for(const ev of (d.events||[])){for(const a of (ev.actions||[])){const tt=a.TonTransfer||a.ton_transfer;if(!tt)continue;const dest=String(tt.recipient?.address||tt.recipient?.account_address||'');if(dest!==wallet&&dest!==normalized)continue;const amount=Number(tt.amount||0)/1e9;out.push({hash:String(ev.event_id||''),to:wallet,amount,ts:Number(ev.timestamp||0)*1000,ok:String(ev.status||'ok').toLowerCase()!=='failed'});}}return out;
+  }catch{return []}
+}
+function sameDest(network:string,a:string,b:string){if(network==='TON')return true;return network==='BEP20'?a.toLowerCase()===b.toLowerCase():a===b;}
+async function settleCrypto(env:Env,invoice:any,tx:ChainTransfer){
+  const txHash=String(tx.hash||'').toLowerCase(); if(!txHash||!tx.ok)return false;
+  const used:any=await env.DB.prepare('SELECT id FROM payment_invoices WHERE tx_hash=? AND id<>?').bind(txHash,invoice.id).first(); if(used)return false;
+  if(!sameDest(String(invoice.network),String(tx.to||''),String(invoice.destination||'')))return false;
+  if(Math.abs(Number(tx.amount)-Number(invoice.expected_amount))>(invoice.network==='TON'?0.00000001:0.0000001))return false;
+  const created=Date.parse(invoice.created_at||'')||0; if(tx.ts&&created&&tx.ts<created-120000)return false;
+  const upd=await env.DB.prepare("UPDATE payment_invoices SET status='paid',tx_hash=?,paid_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'").bind(txHash,invoice.id).run(); if(!upd.meta.changes)return false;
+  await env.DB.prepare("INSERT INTO credit_ledger(telegram_id,amount,kind,ref_type,ref_id,note) VALUES(?,?,'topup','payment',?,?)").bind(invoice.telegram_id,invoice.credit_amount,invoice.public_id,`شارژ خودکار ${invoice.asset} ${invoice.network}`).run();
+  await send(env,invoice.telegram_id,`✅ <b>پرداخت تأیید شد</b>\n\n🧾 ${invoice.public_id}\n🌐 ${invoice.network}\n💎 <b>${Number(invoice.credit_amount).toFixed(2)} Credit</b> به موجودی‌ات اضافه شد.`,[[{text:'💰 مشاهده موجودی',callback_data:'balance'}]]); return true;
+}
+async function scanPendingCrypto(env:Env,onlyPublicId?:string){
+  const base="SELECT * FROM payment_invoices WHERE method='crypto' AND status='pending' AND datetime(expires_at)>datetime('now')";
+  const st=onlyPublicId?env.DB.prepare(base+' AND public_id=?').bind(onlyPublicId):env.DB.prepare(base+' ORDER BY id DESC LIMIT 200'); const q:any=await st.all(); const invoices=q.results||[]; if(!invoices.length)return 0;
+  const grouped:any={BEP20:[],TRC20:[],TON:[]}; for(const i of invoices)(grouped[i.network]||=[]).push(i); let n=0;
+  for(const network of ['BEP20','TRC20','TON']){const invs=grouped[network]||[];if(!invs.length)continue;const wallet=String(invs[0].destination||'');let txs:ChainTransfer[]=[];if(network==='BEP20')txs=await fetchBep20Transfers(env,wallet);else if(network==='TRC20')txs=await fetchTrc20Transfers(env,wallet);else txs=await fetchTonTransfers(env,wallet);for(const inv of invs){for(const tx of txs){if(await settleCrypto(env,inv,tx)){n++;break;}}}}
+  return n;
+}
+async function notifyAdminsCardReceipt(env:Env,inv:any,user:TgUser,fileId:string,isDoc:boolean){
+  const caption=`🏦 <b>رسید کارت به کارت جدید</b>\n\n🧾 <code>${inv.public_id}</code>\n👤 ${user.username?'@'+esc(user.username):esc(user.first_name||String(user.id))}\n🆔 <code>${user.id}</code>\n💵 $${Number(inv.requested_usd).toFixed(2)}\n💎 ${Number(inv.credit_amount).toFixed(2)} Credit`;
+  const reply_markup={inline_keyboard:[[{text:'✅ تأیید',callback_data:`admin:card:approve:${inv.public_id}`},{text:'❌ رد',callback_data:`admin:card:reject:${inv.public_id}`}]]};
+  for(const a of admins(env)){
+    if(isDoc)await tg(env,'sendDocument',{chat_id:a,document:fileId,caption,parse_mode:'HTML',reply_markup}); else await tg(env,'sendPhoto',{chat_id:a,photo:fileId,caption,parse_mode:'HTML',reply_markup});
+  }
+}
+
+async function showShop(env:Env,chat:number,mid?:number){
+  const q:any=await env.DB.prepare("SELECT c.*,(SELECT COUNT(*) FROM products p WHERE p.category_id=c.id AND p.enabled=1) product_count FROM shop_categories c WHERE c.enabled=1 ORDER BY c.sort_order,c.id").all();
+  const cats=(q.results||[]).filter((x:any)=>Number(x.product_count)>0); const rows:Btn[][]=cats.map((c:any)=>[{text:`${c.emoji||'🛍'} ${c.title} (${c.product_count})`,callback_data:`shop:cat:${c.id}:0`}]);
+  rows.push([{text:'🧾 همه محصولات',callback_data:'shop:cat:0:0'}],[{text:'⬅️ منوی اصلی',callback_data:'menu'}]);
+  const t=cats.length?'🛍 <b>فروشگاه</b>\n\nیک دسته‌بندی را انتخاب کن:':'🛍 <b>فروشگاه</b>\n\nفعلاً محصول فعالی ثبت نشده.';
+  mid?await edit(env,chat,mid,t,rows):await send(env,chat,t,rows);
+}
+async function showCategoryProducts(env:Env,chat:number,mid:number,catId:number,page:number){
+  const limit=8,off=page*limit; const where=catId?'p.enabled=1 AND p.category_id=?':'p.enabled=1';
+  const st=catId?env.DB.prepare(`SELECT p.*,(SELECT COUNT(*) FROM product_stock s WHERE s.product_id=p.id AND s.status='available') stock FROM products p WHERE ${where} ORDER BY p.sort_order,p.id LIMIT ? OFFSET ?`).bind(catId,limit+1,off):env.DB.prepare(`SELECT p.*,(SELECT COUNT(*) FROM product_stock s WHERE s.product_id=p.id AND s.status='available') stock FROM products p WHERE ${where} ORDER BY p.sort_order,p.id LIMIT ? OFFSET ?`).bind(limit+1,off);
+  const q:any=await st.all(); const arr=q.results||[]; const more=arr.length>limit; const items=arr.slice(0,limit); let title='همه محصولات';
+  if(catId){const c:any=await env.DB.prepare('SELECT title,emoji FROM shop_categories WHERE id=?').bind(catId).first();if(c)title=`${c.emoji||'🛍'} ${c.title}`;}
+  const rows:Btn[][]=items.map((p:any)=>[{text:`${p.title} — ${Number(p.price_credits).toFixed(2)} cr`,callback_data:`shop:p:${p.id}`}]);
+  const nav:Btn[]=[];if(page>0)nav.push({text:'⬅️ قبلی',callback_data:`shop:cat:${catId}:${page-1}`});if(more)nav.push({text:'بعدی ➡️',callback_data:`shop:cat:${catId}:${page+1}`});if(nav.length)rows.push(nav);rows.push([{text:'⬅️ دسته‌بندی‌ها',callback_data:'shop:list'}]);
+  await edit(env,chat,mid,`🛍 <b>${esc(title)}</b>\n\n${items.length?'محصول موردنظرت را انتخاب کن:':'محصولی در این بخش نیست.'}`,rows);
+}
+async function showProduct(env:Env,chat:number,mid:number,pid:number){
+  const p:any=await env.DB.prepare("SELECT p.*,c.title category_title,c.emoji category_emoji,(SELECT COUNT(*) FROM product_stock s WHERE s.product_id=p.id AND s.status='available') stock FROM products p LEFT JOIN shop_categories c ON c.id=p.category_id WHERE p.id=? AND p.enabled=1").bind(pid).first();
+  if(!p)return edit(env,chat,mid,'❌ محصول پیدا نشد.',[[{text:'⬅️ فروشگاه',callback_data:'shop:list'}]]);
+  let t=`${p.category_emoji||'🛍'} <b>${esc(p.title)}</b>\n\n${esc(p.description||'')}\n\n💎 قیمت: <b>${Number(p.price_credits).toFixed(2)} Credit</b>\n📦 موجودی: <b>${p.stock}</b>`;
+  if(p.warranty_text)t+=`\n🛡 ضمانت: <b>${esc(p.warranty_text)}</b>`; if(p.format_text)t+=`\n📋 فرمت تحویل: <b>${esc(p.format_text)}</b>`;
+  const qtys=[1,2,3,5,10].filter(x=>x<=Number(p.stock)); const rows:Btn[][]=[]; if(qtys.length)rows.push(qtys.map(q=>({text:String(q),callback_data:`shop:summary:${p.id}:${q}:0`})));
+  rows.push([{text:'⬅️ بازگشت',callback_data:p.category_id?`shop:cat:${p.category_id}:0`:'shop:list'}]); await edit(env,chat,mid,t,rows);
+}
+async function validDiscount(env:Env,id:number,subtotal:number){
+  if(!id)return null; const d:any=await env.DB.prepare("SELECT * FROM discount_codes WHERE id=? AND enabled=1 AND (expires_at IS NULL OR datetime(expires_at)>datetime('now'))").bind(id).first(); if(!d)return null;
+  if(Number(d.min_total||0)>subtotal)return null; if(d.max_uses!==null&&Number(d.uses_count)>=Number(d.max_uses))return null; return d;
+}
+function discountAmount(d:any,subtotal:number){if(!d)return 0; const x=d.discount_type==='percent'?subtotal*Number(d.value)/100:Number(d.value);return Math.max(0,Math.min(subtotal,x));}
+async function showOrderSummary(env:Env,uid:number,chat:number,mid:number,pid:number,qty:number,discountId=0){
+  const p:any=await env.DB.prepare("SELECT p.*,(SELECT COUNT(*) FROM product_stock s WHERE s.product_id=p.id AND s.status='available') stock FROM products p WHERE id=? AND enabled=1").bind(pid).first(); if(!p||qty<1||qty>Number(p.stock))return edit(env,chat,mid,'❌ موجودی کافی نیست.',[[{text:'⬅️ فروشگاه',callback_data:'shop:list'}]]);
+  const subtotal=Number(p.price_credits)*qty; const d=await validDiscount(env,discountId,subtotal); const off=discountAmount(d,subtotal); const total=subtotal-off; const b=await balance(env,uid);
+  let t=`🛒 <b>خلاصه سفارش</b>\n\n📦 محصول: <b>${esc(p.title)}</b>\n🔢 تعداد: <b>${qty}</b>\n💎 قیمت اولیه: <b>${subtotal.toFixed(2)} Credit</b>`;
+  if(d)t+=`\n🏷 کد تخفیف: <b>${esc(d.code)}</b>\n➖ تخفیف: <b>${off.toFixed(2)} Credit</b>`; t+=`\n💰 مبلغ نهایی: <b>${total.toFixed(2)} Credit</b>\n\nموجودی فعلی: <b>${b.total.toFixed(2)} Credit</b>`;
+  await edit(env,chat,mid,t,[[{text:'🏷 وارد کردن کد تخفیف',callback_data:`shop:discount:${pid}:${qty}`}],[{text:'✅ تأیید و پرداخت',callback_data:`shop:buy:${pid}:${qty}:${d?.id||0}`}],[{text:'⬅️ بازگشت',callback_data:`shop:p:${pid}`}]]);
+}
+async function buyProduct(env:Env,uid:number,chat:number,mid:number,pid:number,qty:number,discountId=0){
+  const p:any=await env.DB.prepare('SELECT * FROM products WHERE id=? AND enabled=1').bind(pid).first(); if(!p)return;
+  const subtotal=Number(p.price_credits)*qty; const d=await validDiscount(env,discountId,subtotal); const off=discountAmount(d,subtotal); const total=subtotal-off; const b=await balance(env,uid);
+  if(b.total+1e-9<total)return edit(env,chat,mid,`❌ موجودی کافی نیست.\n\nنیاز: <b>${total.toFixed(2)}</b>\nموجودی: <b>${b.total.toFixed(2)}</b>`,[[{text:'💳 خرید اعتبار',callback_data:'credit:buy'}],[{text:'⬅️ بازگشت',callback_data:`shop:p:${pid}`}]]);
+  const stocks:any=await env.DB.prepare("SELECT * FROM product_stock WHERE product_id=? AND status='available' ORDER BY id LIMIT ?").bind(pid,qty).all(); if((stocks.results||[]).length<qty)return edit(env,chat,mid,'❌ موجودی کافی نیست.',[[{text:'⬅️ بازگشت',callback_data:`shop:p:${pid}`}]]);
+  const oid=publicId('O'); const costTotal=Number(p.cost_credits||0)*qty; const r=await env.DB.prepare("INSERT INTO orders(public_id,telegram_id,product_id,quantity,unit_price,total_price,status,discount_code,discount_amount,cost_total) VALUES(?,?,?,?,?,?,'processing',?,?,?)").bind(oid,uid,pid,qty,p.price_credits,total,d?.code||null,off,costTotal).run(); const orderId=r.meta.last_row_id;
+  const statements:any[]=[env.DB.prepare("INSERT INTO credit_ledger(telegram_id,amount,kind,ref_type,ref_id,note) VALUES(?,?,'purchase','order',?,'خرید از فروشگاه')").bind(uid,-total,oid)];
+  for(const st of stocks.results)statements.push(env.DB.prepare("UPDATE product_stock SET status='delivered',order_id=?,delivered_at=CURRENT_TIMESTAMP WHERE id=? AND status='available'").bind(orderId,st.id));
+  if(d)statements.push(env.DB.prepare('UPDATE discount_codes SET uses_count=uses_count+1 WHERE id=?').bind(d.id)); statements.push(env.DB.prepare("UPDATE orders SET status='completed',completed_at=CURRENT_TIMESTAMP WHERE id=?").bind(orderId)); await env.DB.batch(statements);
+  const delivered=(stocks.results||[]).map((x:any,i:number)=>`${i+1}. <code>${esc(x.secret_value)}</code>`).join('\n'); let payText=`💎 ${total.toFixed(2)} Credit`;if(off)payText+=` (تخفیف ${off.toFixed(2)})`;
+  await edit(env,chat,mid,`✅ <b>سفارش تکمیل شد</b>\n\n🧾 ${oid}\n🛍 ${esc(p.title)} × ${qty}\n${payText}\n\n📦 <b>تحویل:</b>\n${delivered}`,[[{text:'🆘 مشکل با این سفارش',callback_data:`support:order:${orderId}`}],[{text:'📜 تاریخچه',callback_data:'history:shop:0'}],[{text:'🏠 منوی اصلی',callback_data:'menu'}]]);
+}
+
+const faStatus=(s:string)=>({completed:'✅ تکمیل',paid:'✅ پرداخت‌شده',pending:'⏳ در انتظار',expired:'⌛ منقضی',cancelled:'❌ لغوشده',manual_review:'🔎 بررسی دستی',awaiting_receipt:'📷 منتظر رسید',rejected:'❌ ردشده',processing:'⚙️ پردازش',refunded:'↩️ Refund'}[s]||s);
+async function showHistoryMenu(env:Env,chat:number,mid:number){
+  await edit(env,chat,mid,'📜 <b>تاریخچه من</b>\n\nچه چیزی را می‌خواهی ببینی؟',[[{text:'🛍 تاریخچه فروشگاه',callback_data:'history:shop:0'}],[{text:'💳 تاریخچه پرداخت‌ها',callback_data:'history:pay:0'}],[{text:'⬅️ منوی اصلی',callback_data:'menu'}]]);
+}
+async function showShopHistory(env:Env,uid:number,chat:number,mid:number,page:number){
+  const limit=5,off=page*limit;
+  const q:any=await env.DB.prepare('SELECT o.*,p.title FROM orders o JOIN products p ON p.id=o.product_id WHERE o.telegram_id=? ORDER BY o.id DESC LIMIT ? OFFSET ?').bind(uid,limit+1,off).all();
+  const rows=q.results||[]; const more=rows.length>limit; const items=rows.slice(0,limit);
+  let t=`🛍 <b>تاریخچه فروشگاه</b> — صفحه ${page+1}\n\n`;
+  if(!items.length)t+='هنوز سفارشی نداری.';
+  items.forEach((x:any,i:number)=>{t+=`${i+1}. <b>${esc(x.title)}</b> × ${x.quantity}\n🧾 <code>${x.public_id}</code> — ${faStatus(x.status)} — 💎 ${Number(x.total_price).toFixed(2)}\n\n`});
+  const nav:Btn[]=[]; if(page>0)nav.push({text:'⬅️ قبلی',callback_data:`history:shop:${page-1}`}); if(more)nav.push({text:'بعدی ➡️',callback_data:`history:shop:${page+1}`});
+  const kb:Btn[][]=[]; if(nav.length)kb.push(nav); kb.push([{text:'📜 تاریخچه',callback_data:'history:menu'}]);
+  await edit(env,chat,mid,t,kb);
+}
+async function showPaymentHistory(env:Env,uid:number,chat:number,mid:number,page:number){
+  const limit=6,off=page*limit;
+  const q:any=await env.DB.prepare('SELECT * FROM payment_invoices WHERE telegram_id=? ORDER BY id DESC LIMIT ? OFFSET ?').bind(uid,limit+1,off).all();
+  const rows=q.results||[]; const more=rows.length>limit; const items=rows.slice(0,limit);
+  let t=`💳 <b>تاریخچه پرداخت‌ها</b> — صفحه ${page+1}\n\n`;
+  if(!items.length)t+='هنوز پرداختی نداری.';
+  items.forEach((x:any,i:number)=>{t+=`${i+1}. <code>${x.public_id}</code>\n${x.method==='card'?'🏦 کارت به کارت':`${x.network==='TRC20'?'🔴':x.network==='TON'?'💎':'🟡'} ${x.asset||'USDT'} ${x.network||''}`} — ${faStatus(x.status)}\n💵 $${Number(x.requested_usd).toFixed(2)} → 💎 ${Number(x.credit_amount).toFixed(2)}\n\n`});
+  const nav:Btn[]=[]; if(page>0)nav.push({text:'⬅️ قبلی',callback_data:`history:pay:${page-1}`}); if(more)nav.push({text:'بعدی ➡️',callback_data:`history:pay:${page+1}`});
+  const kb:Btn[][]=[]; if(nav.length)kb.push(nav); kb.push([{text:'📜 تاریخچه',callback_data:'history:menu'}]);
+  await edit(env,chat,mid,t,kb);
+}
+async function showReferral(env:Env,uid:number,chat:number,mid:number){
+  const s:any=await env.DB.prepare("SELECT COUNT(*) total,SUM(CASE WHEN status='rewarded' THEN 1 ELSE 0 END) rewarded,SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending,COALESCE(SUM(CASE WHEN status='rewarded' THEN reward ELSE 0 END),0) earned FROM referrals WHERE inviter_telegram_id=?").bind(uid).first();
+  const link=`https://t.me/${env.BOT_USERNAME}?start=ref_${uid}`;
+  const t=`🎁 <b>دعوت و درآمد</b>\n\n🔗 لینک اختصاصی:\n<code>${link}</code>\n\n👥 کل دعوت‌ها: <b>${Number(s?.total||0)}</b>\n✅ پاداش‌گرفته: <b>${Number(s?.rewarded||0)}</b>\n⏳ در انتظار: <b>${Number(s?.pending||0)}</b>\n💰 درآمد: <b>${Number(s?.earned||0).toFixed(2)} Credit</b>\n\nهر دعوت معتبر: <b>${Number(env.REFERRAL_REWARD||0.05).toFixed(2)} Credit</b>`;
+  await edit(env,chat,mid,t,[[{text:'📋 کپی لینک دعوت',copy_text:{text:link}}],[{text:'⬅️ منوی اصلی',callback_data:'menu'}]]);
+}
+
+async function showSupportMenu(env:Env,chat:number,mid:number){
+  await edit(env,chat,mid,'🆘 <b>پشتیبانی</b>\n\nموضوع مشکل را انتخاب کن:',[
+    [{text:'💳 مشکل پرداخت',callback_data:'support:new:payment'}],
+    [{text:'🛍 مشکل محصول / سفارش',callback_data:'support:orders'}],
+    [{text:'❓ سایر موارد',callback_data:'support:new:other'}],
+    [{text:'🎫 تیکت‌های من',callback_data:'support:mine'}],[{text:'⬅️ منوی اصلی',callback_data:'menu'}]
+  ]);
+}
+async function showSupportOrders(env:Env,uid:number,chat:number,mid:number){
+  const q:any=await env.DB.prepare('SELECT o.id,o.public_id,p.title FROM orders o JOIN products p ON p.id=o.product_id WHERE o.telegram_id=? ORDER BY o.id DESC LIMIT 10').bind(uid).all();
+  const rows:Btn[][]=(q.results||[]).map((x:any)=>[{text:`${x.public_id} — ${x.title}`.slice(0,60),callback_data:`support:order:${x.id}`}]);
+  rows.push([{text:'⬅️ پشتیبانی',callback_data:'support:menu'}]);
+  await edit(env,chat,mid,'🛍 <b>مشکل محصول / سفارش</b>\n\nسفارشی که با آن مشکل داری انتخاب کن:',rows);
+}
+async function beginTicket(env:Env,uid:number,chat:number,mid:number,category:string,orderId?:number){
+  await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`await_ticket:${category}:${orderId||0}`,uid).run();
+  await edit(env,chat,mid,'✍️ <b>شرح مشکل را ارسال کن</b>\n\nمی‌توانی متن، عکس یا فایل بفرستی. بعد از ارسال، تیکت ساخته می‌شود و ادمین پاسخ را داخل همین ربات می‌فرستد.',[[{text:'❌ انصراف',callback_data:'support:cancel'}]]);
+}
+async function createTicketFromMessage(env:Env,m:Message,state:string){
+  if(!m.from)return;
+  const [,category,orderRaw]=state.split(':'); const orderId=Number(orderRaw)||null;
+  const pid=publicId('T');
+  const r=await env.DB.prepare('INSERT INTO support_tickets(public_id,telegram_id,category,order_id,status,last_message) VALUES(?,?,?,?,\'open\',?)').bind(pid,m.from.id,category,orderId,m.text||m.caption||'[فایل]').run();
+  const ticketId=Number(r.meta.last_row_id);
+  const type=m.photo?.length?'photo':m.document?'document':'text';
+  const fileId=m.photo?.length?m.photo[m.photo.length-1].file_id:m.document?.file_id||null;
+  await env.DB.batch([
+    env.DB.prepare('INSERT INTO support_messages(ticket_id,sender_type,sender_telegram_id,message_type,text,file_id) VALUES(?,\'user\',?,?,?,?)').bind(ticketId,m.from.id,type,m.text||m.caption||null,fileId),
+    env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(m.from.id)
+  ]);
+  const orderText=orderId?`\n🛍 Order ID: <code>${orderId}</code>`:'';
+  const cap=`🎫 <b>تیکت جدید</b>\n\n🧾 <code>${pid}</code>\n👤 ${m.from.username?'@'+esc(m.from.username):esc(m.from.first_name||String(m.from.id))}\n🆔 <code>${m.from.id}</code>\n📂 ${esc(category)}${orderText}\n\n${esc(m.text||m.caption||'فایل پیوست شده')}`;
+  const kb={inline_keyboard:[[{text:'💬 پاسخ',callback_data:`admin:ticket:reply:${ticketId}`},{text:'✅ بستن',callback_data:`admin:ticket:close:${ticketId}`}]]};
+  for(const a of admins(env)){
+    if(type==='photo')await tg(env,'sendPhoto',{chat_id:a,photo:fileId,caption:cap,parse_mode:'HTML',reply_markup:kb});
+    else if(type==='document')await tg(env,'sendDocument',{chat_id:a,document:fileId,caption:cap,parse_mode:'HTML',reply_markup:kb});
+    else await tg(env,'sendMessage',{chat_id:a,text:cap,parse_mode:'HTML',reply_markup:kb});
+  }
+  await send(env,m.chat.id,`✅ تیکت <code>${pid}</code> ساخته شد.\nپاسخ پشتیبانی از همین ربات برایت ارسال می‌شود.`,[[{text:'🎫 تیکت‌های من',callback_data:'support:mine'}],[{text:'🏠 منوی اصلی',callback_data:'menu'}]]);
+}
+async function showMyTickets(env:Env,uid:number,chat:number,mid:number){
+  const q:any=await env.DB.prepare('SELECT * FROM support_tickets WHERE telegram_id=? ORDER BY id DESC LIMIT 10').bind(uid).all();
+  let t='🎫 <b>تیکت‌های من</b>\n\n'; if(!(q.results||[]).length)t+='تیکتی نداری.';
+  for(const x of q.results||[])t+=`• <code>${x.public_id}</code> — ${x.status==='open'?'🟢 باز':'⚪ بسته'}\n${esc((x.last_message||'').slice(0,90))}\n\n`;
+  await edit(env,chat,mid,t,[[{text:'⬅️ پشتیبانی',callback_data:'support:menu'}]]);
+}
+async function forwardUserTicketMessage(env:Env,m:Message,ticket:any){
+  const type=m.photo?.length?'photo':m.document?'document':'text'; const fileId=m.photo?.length?m.photo[m.photo.length-1].file_id:m.document?.file_id||null; const txt=m.text||m.caption||null;
+  await env.DB.batch([
+    env.DB.prepare('INSERT INTO support_messages(ticket_id,sender_type,sender_telegram_id,message_type,text,file_id) VALUES(?,\'user\',?,?,?,?)').bind(ticket.id,m.from!.id,type,txt,fileId),
+    env.DB.prepare('UPDATE support_tickets SET last_message=?,updated_at=CURRENT_TIMESTAMP,status=\'open\' WHERE id=?').bind(txt||'[فایل]',ticket.id)
+  ]);
+  const cap=`💬 <b>پیام جدید در تیکت</b> <code>${ticket.public_id}</code>\n\n${esc(txt||'فایل پیوست شده')}`;
+  const kb={inline_keyboard:[[{text:'💬 پاسخ',callback_data:`admin:ticket:reply:${ticket.id}`},{text:'✅ بستن',callback_data:`admin:ticket:close:${ticket.id}`}]]};
+  for(const a of admins(env)){
+    if(type==='photo')await tg(env,'sendPhoto',{chat_id:a,photo:fileId,caption:cap,parse_mode:'HTML',reply_markup:kb}); else if(type==='document')await tg(env,'sendDocument',{chat_id:a,document:fileId,caption:cap,parse_mode:'HTML',reply_markup:kb}); else await tg(env,'sendMessage',{chat_id:a,text:cap,parse_mode:'HTML',reply_markup:kb});
+  }
+}
+
+async function showAdmin(env:Env,chat:number,mid?:number){
+  const users:any=await env.DB.prepare('SELECT COUNT(*) c FROM users').first();
+  const cards:any=await env.DB.prepare("SELECT COUNT(*) c FROM payment_invoices WHERE method='card' AND status='manual_review'").first();
+  const tickets:any=await env.DB.prepare("SELECT COUNT(*) c FROM support_tickets WHERE status='open'").first();
+  const products:any=await env.DB.prepare('SELECT COUNT(*) c FROM products WHERE enabled=1').first();
+  const t=`🛠 <b>پنل مدیریت</b>\n\n👥 کاربران: <b>${Number(users?.c||0)}</b>\n🏦 رسید در انتظار: <b>${Number(cards?.c||0)}</b>\n🎫 تیکت باز: <b>${Number(tickets?.c||0)}</b>\n🛍 محصولات فعال: <b>${Number(products?.c||0)}</b>`;
+  const rows:Btn[][]=[
+    [{text:'🛍 محصولات',callback_data:'admin:products'},{text:'📦 استوک',callback_data:'admin:stock'}],
+    [{text:'🗂 دسته‌بندی‌ها',callback_data:'admin:categories'},{text:'🏷 کدهای تخفیف',callback_data:'admin:discounts'}],
+    [{text:'📢 جوین اجباری',callback_data:'admin:channels'},{text:'💳 تنظیمات پرداخت',callback_data:'admin:payments'}],
+    [{text:'🧾 سفارش‌ها / Refund',callback_data:'admin:orders'},{text:'🎫 تیکت‌ها',callback_data:'admin:tickets'}],
+    [{text:'📣 Broadcast',callback_data:'admin:broadcast'},{text:'🔄 اسکن کریپتو',callback_data:'admin:scan'}],
+    [{text:'📊 آمار',callback_data:'admin:stats'}],[{text:'🏠 منوی کاربر',callback_data:'menu'}]
+  ];
+  mid?await edit(env,chat,mid,t,rows):await send(env,chat,t,rows);
+}
+async function adminProducts(env:Env,chat:number,mid:number){
+  const q:any=await env.DB.prepare("SELECT p.*,(SELECT COUNT(*) FROM product_stock s WHERE s.product_id=p.id AND s.status='available') stock FROM products p ORDER BY id DESC LIMIT 20").all();
+  const rows:Btn[][]=(q.results||[]).map((p:any)=>[{text:`${p.enabled?'🟢':'⚪'} ${p.title} (${p.stock})`.slice(0,58),callback_data:`admin:product:${p.id}`}]);
+  rows.push([{text:'➕ محصول جدید',callback_data:'admin:product:new'}],[{text:'⬅️ پنل مدیریت',callback_data:'admin:home'}]);
+  await edit(env,chat,mid,'🛍 <b>مدیریت محصولات</b>\n\nبرای ویرایش هر محصول روی آن بزن.',rows);
+}
+async function adminProductDetail(env:Env,chat:number,mid:number,pid:number){
+  const p:any=await env.DB.prepare("SELECT p.*,(SELECT COUNT(*) FROM product_stock s WHERE s.product_id=p.id AND s.status='available') stock FROM products p WHERE id=?").bind(pid).first(); if(!p)return;
+  const t=`🛍 <b>${esc(p.title)}</b>\n\nID: <code>${p.id}</code>\n💎 قیمت: ${Number(p.price_credits).toFixed(2)} cr\n📦 استوک: ${p.stock}\nوضعیت: ${p.enabled?'🟢 فعال':'⚪ غیرفعال'}\n\n${esc(p.description||'')}`;
+  await edit(env,chat,mid,t,[[{text:p.enabled?'⏸ غیرفعال':'▶️ فعال',callback_data:`admin:product:toggle:${p.id}`}],[{text:'📦 افزودن استوک',callback_data:`admin:stock:add:${p.id}`}],[{text:'💎 تغییر قیمت',callback_data:`admin:product:price:${p.id}`},{text:'🗂 تغییر دسته',callback_data:`admin:product:category:${p.id}`}],[{text:'⬅️ محصولات',callback_data:'admin:products'}]]);
+}
+async function adminStock(env:Env,chat:number,mid:number){
+  const q:any=await env.DB.prepare("SELECT p.id,p.title,(SELECT COUNT(*) FROM product_stock s WHERE s.product_id=p.id AND s.status='available') stock FROM products p ORDER BY id DESC LIMIT 20").all();
+  const rows:Btn[][]=(q.results||[]).map((p:any)=>[{text:`📦 ${p.title} — ${p.stock}`,callback_data:`admin:stock:add:${p.id}`}]); rows.push([{text:'⬅️ پنل مدیریت',callback_data:'admin:home'}]);
+  await edit(env,chat,mid,'📦 <b>مدیریت استوک</b>\n\nمحصول را انتخاب کن و استوک‌ها را خط‌به‌خط بفرست.',rows);
+}
+async function adminTickets(env:Env,chat:number,mid:number){
+  const q:any=await env.DB.prepare("SELECT * FROM support_tickets WHERE status='open' ORDER BY id DESC LIMIT 20").all();
+  const rows:Btn[][]=(q.results||[]).map((t:any)=>[{text:`🎫 ${t.public_id} — ${t.category}`,callback_data:`admin:ticket:view:${t.id}`}]); rows.push([{text:'⬅️ پنل مدیریت',callback_data:'admin:home'}]);
+  await edit(env,chat,mid,'🎫 <b>تیکت‌های باز</b>',rows);
+}
+async function adminTicketView(env:Env,chat:number,mid:number,id:number){
+  const t:any=await env.DB.prepare('SELECT * FROM support_tickets WHERE id=?').bind(id).first(); if(!t)return;
+  const ms:any=await env.DB.prepare('SELECT * FROM support_messages WHERE ticket_id=? ORDER BY id DESC LIMIT 6').bind(id).all();
+  let text=`🎫 <b>${t.public_id}</b>\n👤 <code>${t.telegram_id}</code>\n📂 ${esc(t.category)}\nوضعیت: ${t.status}\n\n`;
+  for(const m of (ms.results||[]).reverse())text+=`${m.sender_type==='admin'?'👨‍💻':'👤'} ${esc(m.text||'[فایل]')}\n`;
+  await edit(env,chat,mid,text,[[{text:'💬 پاسخ',callback_data:`admin:ticket:reply:${id}`}],[{text:'✅ بستن',callback_data:`admin:ticket:close:${id}`}],[{text:'⬅️ تیکت‌ها',callback_data:'admin:tickets'}]]);
+}
+async function adminStats(env:Env,chat:number,mid:number){
+  const u:any=await env.DB.prepare('SELECT COUNT(*) users FROM users').first();
+  const sales:any=await env.DB.prepare("SELECT COUNT(*) orders,COALESCE(SUM(total_price),0) revenue FROM orders WHERE status='completed'").first();
+  const topups:any=await env.DB.prepare("SELECT COALESCE(SUM(credit_amount),0) credits FROM payment_invoices WHERE status='paid'").first();
+  const refs:any=await env.DB.prepare("SELECT COUNT(*) c FROM referrals WHERE status='rewarded'").first();
+  await edit(env,chat,mid,`📊 <b>آمار کلی</b>\n\n👥 کاربران: <b>${Number(u?.users||0)}</b>\n🛍 سفارش تکمیل‌شده: <b>${Number(sales?.orders||0)}</b>\n💎 فروش فروشگاه: <b>${Number(sales?.revenue||0).toFixed(2)} Credit</b>\n💳 شارژ تأییدشده: <b>${Number(topups?.credits||0).toFixed(2)} Credit</b>\n🎁 Referral موفق: <b>${Number(refs?.c||0)}</b>`,[[{text:'⬅️ پنل مدیریت',callback_data:'admin:home'}]]);
+}
+
+async function adminCategories(env:Env,chat:number,mid:number){
+  const q:any=await env.DB.prepare('SELECT c.*,(SELECT COUNT(*) FROM products p WHERE p.category_id=c.id) products FROM shop_categories c ORDER BY sort_order,id').all();
+  const rows:Btn[][]=(q.results||[]).map((c:any)=>[{text:`${c.enabled?'🟢':'⚪'} ${c.emoji||'🛍'} ${c.title} (${c.products})`,callback_data:`admin:category:toggle:${c.id}`}]);
+  rows.push([{text:'➕ دسته جدید',callback_data:'admin:category:new'}],[{text:'⬅️ پنل مدیریت',callback_data:'admin:home'}]);
+  await edit(env,chat,mid,'🗂 <b>دسته‌بندی‌های فروشگاه</b>\n\nبا لمس هر دسته فعال/غیرفعال می‌شود.',rows);
+}
+async function adminProductCategory(env:Env,chat:number,mid:number,pid:number){
+  const q:any=await env.DB.prepare('SELECT * FROM shop_categories ORDER BY sort_order,id').all();
+  const rows:Btn[][]=(q.results||[]).map((c:any)=>[{text:`${c.emoji||'🛍'} ${c.title}`,callback_data:`admin:product:setcat:${pid}:${c.id}`}]); rows.push([{text:'⬅️ محصول',callback_data:`admin:product:${pid}`}]);
+  await edit(env,chat,mid,'🗂 دسته‌بندی جدید محصول را انتخاب کن:',rows);
+}
+async function adminChannels(env:Env,chat:number,mid:number){
+  const q:any=await env.DB.prepare('SELECT * FROM required_channels ORDER BY sort_order,id').all();
+  const rows:Btn[][]=(q.results||[]).map((c:any)=>[{text:`${c.enabled?'🟢':'⚪'} ${c.title}`,callback_data:`admin:channel:toggle:${c.id}`},{text:'🗑',callback_data:`admin:channel:delete:${c.id}`}]);
+  rows.push([{text:'➕ افزودن کانال',callback_data:'admin:channel:new'}],[{text:'⬅️ پنل مدیریت',callback_data:'admin:home'}]);
+  await edit(env,chat,mid,'📢 <b>جوین اجباری</b>\n\nبات باید در کانال/گروه موردنظر Admin باشد. با لمس نام، وضعیت فعال/غیرفعال می‌شود.',rows);
+}
+async function adminDiscounts(env:Env,chat:number,mid:number){
+  const q:any=await env.DB.prepare('SELECT * FROM discount_codes ORDER BY id DESC LIMIT 30').all();
+  const rows:Btn[][]=(q.results||[]).map((d:any)=>[{text:`${d.enabled?'🟢':'⚪'} ${d.code} — ${d.discount_type==='percent'?d.value+'%':d.value+' cr'} (${d.uses_count}${d.max_uses!==null?'/'+d.max_uses:''})`,callback_data:`admin:discount:toggle:${d.id}`}]);
+  rows.push([{text:'➕ کد جدید',callback_data:'admin:discount:new'}],[{text:'⬅️ پنل مدیریت',callback_data:'admin:home'}]);
+  await edit(env,chat,mid,'🏷 <b>کدهای تخفیف</b>\n\nبا لمس هر کد فعال/غیرفعال می‌شود.',rows);
+}
+async function adminPayments(env:Env,chat:number,mid:number){
+  const c=await paymentConfig(env); const short=(x:string)=>x?`${x.slice(0,8)}…${x.slice(-6)}`:'تنظیم نشده';
+  const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase(); const updated=await getSetting(env,'ton_usd_rate_updated_at','');
+  const t=`💳 <b>تنظیمات پرداخت</b>\n\n🟡 BEP20: <code>${esc(short(c.bep20))}</code>\n🔴 TRC20: <code>${esc(short(c.trc20))}</code>\n💎 TON: <code>${esc(short(c.ton))}</code>\n📈 نرخ TON/USD: <b>${c.tonRate||'تنظیم نشده'}</b>\n🤖 حالت نرخ TON: <b>${mode==='auto'?'خودکار':'دستی'}</b>${updated?`\n🕒 آخرین نرخ خودکار: ${esc(updated)}`:''}\n🏦 کارت: <code>${esc(c.card||'تنظیم نشده')}</code>\n👤 صاحب کارت: <b>${esc(c.cardHolder||'—')}</b>`;
+  await edit(env,chat,mid,t,[[{text:'🟡 آدرس BEP20',callback_data:'admin:payset:wallet_bep20'},{text:'🔴 آدرس TRC20',callback_data:'admin:payset:wallet_trc20'}],[{text:'💎 آدرس TON',callback_data:'admin:payset:wallet_ton'},{text:'📈 نرخ دستی TON',callback_data:'admin:payset:ton_usd_rate'}],[{text:mode==='auto'?'✅ نرخ خودکار':'🤖 فعال‌کردن نرخ خودکار',callback_data:'admin:tonrate:auto'},{text:'🔄 بروزرسانی نرخ',callback_data:'admin:tonrate:refresh'}],[{text:'✍️ حالت دستی',callback_data:'admin:tonrate:manual'}],[{text:'🏦 شماره کارت',callback_data:'admin:payset:card_number'},{text:'👤 صاحب کارت',callback_data:'admin:payset:card_holder'}],[{text:'⬅️ پنل مدیریت',callback_data:'admin:home'}]]);
+}
+async function adminOrders(env:Env,chat:number,mid:number){
+  const q:any=await env.DB.prepare("SELECT o.*,p.title FROM orders o JOIN products p ON p.id=o.product_id ORDER BY o.id DESC LIMIT 20").all();
+  const rows:Btn[][]=(q.results||[]).map((o:any)=>[{text:`${o.refunded_at?'↩️':'🧾'} ${o.public_id} — ${o.title} — ${Number(o.total_price).toFixed(2)}cr`.slice(0,62),callback_data:`admin:order:${o.id}`}]); rows.push([{text:'⬅️ پنل مدیریت',callback_data:'admin:home'}]);
+  await edit(env,chat,mid,'🧾 <b>سفارش‌های اخیر</b>\n\nبرای جزئیات و Refund روی سفارش بزن.',rows);
+}
+async function adminOrderDetail(env:Env,chat:number,mid:number,id:number){
+  const o:any=await env.DB.prepare('SELECT o.*,p.title FROM orders o JOIN products p ON p.id=o.product_id WHERE o.id=?').bind(id).first(); if(!o)return;
+  const t=`🧾 <b>${o.public_id}</b>\n\n👤 <code>${o.telegram_id}</code>\n🛍 ${esc(o.title)} × ${o.quantity}\n💎 مبلغ نهایی: <b>${Number(o.total_price).toFixed(2)} Credit</b>\n🏷 تخفیف: <b>${Number(o.discount_amount||0).toFixed(2)}</b>${o.discount_code?` (${esc(o.discount_code)})`:''}\nوضعیت: ${faStatus(o.status)}\n↩️ Refund: ${o.refunded_at?'✅ انجام شده':'❌ انجام نشده'}`;
+  const rows:Btn[][]=[]; if(!o.refunded_at&&o.status==='completed')rows.push([{text:'↩️ Refund کامل به Credit',callback_data:`admin:order:refund:${o.id}`}]); rows.push([{text:'⬅️ سفارش‌ها',callback_data:'admin:orders'}]); await edit(env,chat,mid,t,rows);
+}
+async function refundOrder(env:Env,adminId:number,id:number){
+  const o:any=await env.DB.prepare("SELECT * FROM orders WHERE id=? AND status='completed' AND refunded_at IS NULL").bind(id).first(); if(!o)return null;
+  const amount=Number(o.total_price); const upd=await env.DB.prepare("UPDATE orders SET status='refunded',refunded_at=CURRENT_TIMESTAMP,refund_amount=? WHERE id=? AND refunded_at IS NULL").bind(amount,id).run(); if(!upd.meta.changes)return null;
+  await env.DB.prepare("INSERT INTO credit_ledger(telegram_id,amount,kind,ref_type,ref_id,note) VALUES(?,?,'refund','order',?,'Refund سفارش')").bind(o.telegram_id,amount,o.public_id).run(); await logAdmin(env,adminId,'order_refund','order',o.public_id,`amount=${amount}`);
+  await send(env,o.telegram_id,`↩️ <b>Refund انجام شد</b>\n\n🧾 ${o.public_id}\n💎 ${amount.toFixed(2)} Credit به موجودی شما برگشت داده شد.`,[[{text:'💰 موجودی',callback_data:'balance'}]]); return o;
+}
+
+async function processBroadcasts(env:Env){
+  const b:any=await env.DB.prepare("SELECT * FROM broadcasts WHERE status IN ('queued','running') ORDER BY id LIMIT 1").first(); if(!b)return;
+  if(b.status==='queued')await env.DB.prepare("UPDATE broadcasts SET status='running',started_at=CURRENT_TIMESTAMP WHERE id=?").bind(b.id).run();
+  const users:any=await env.DB.prepare('SELECT id,telegram_id FROM users WHERE id>? ORDER BY id LIMIT 20').bind(b.last_user_id||0).all();
+  const arr=users.results||[];
+  if(!arr.length){await env.DB.prepare("UPDATE broadcasts SET status='completed',completed_at=CURRENT_TIMESTAMP WHERE id=?").bind(b.id).run();return;}
+  let sent=0,failed=0,last=b.last_user_id||0;
+  for(const u of arr){last=u.id; const r=await send(env,u.telegram_id,b.text); if(r.ok)sent++; else failed++;}
+  await env.DB.prepare('UPDATE broadcasts SET last_user_id=?,sent_count=sent_count+?,failed_count=failed_count+? WHERE id=?').bind(last,sent,failed,b.id).run();
+}
+
+async function handleAdminState(env:Env,m:Message,state:string){
+  if(!m.from||!isAdmin(env,m.from.id))return false;
+  const uid=m.from.id; const text=(m.text||m.caption||'').trim();
+  if(state==='admin_broadcast'){
+    if(!text)return true;
+    const id=publicId('B'); await env.DB.batch([
+      env.DB.prepare("INSERT INTO broadcasts(public_id,admin_telegram_id,text,status) VALUES(?,?,?,'queued')").bind(id,uid,text),
+      env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid)
+    ]); await logAdmin(env,uid,'broadcast_create','broadcast',id,text.slice(0,200)); await send(env,m.chat.id,`✅ Broadcast <code>${id}</code> وارد صف شد.\nهر دقیقه برای گروهی از کاربران ارسال می‌شود.`,[[{text:'🛠 پنل مدیریت',callback_data:'admin:home'}]]); return true;
+  }
+  if(state.startsWith('admin_stock:')){
+    const pid=Number(state.split(':')[1]); const lines=text.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+    if(!lines.length){await send(env,m.chat.id,'هر استوک را در یک خط بفرست.');return true;}
+    const stmts=lines.map(x=>env.DB.prepare('INSERT INTO product_stock(product_id,secret_value) VALUES(?,?)').bind(pid,x)); await env.DB.batch(stmts); await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run(); await logAdmin(env,uid,'stock_add','product',String(pid),`count=${lines.length}`); await send(env,m.chat.id,`✅ ${lines.length} استوک اضافه شد.`,[[{text:'🛍 مشاهده محصول',callback_data:`admin:product:${pid}`}],[{text:'🛠 پنل مدیریت',callback_data:'admin:home'}]]); return true;
+  }
+  if(state.startsWith('admin_price:')){
+    const pid=Number(state.split(':')[1]); const price=Number(text); if(!Number.isFinite(price)||price<0){await send(env,m.chat.id,'قیمت معتبر بفرست. مثال: <code>0.70</code>');return true;}
+    await env.DB.batch([env.DB.prepare('UPDATE products SET price_credits=? WHERE id=?').bind(price,pid),env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid)]); await logAdmin(env,uid,'product_price','product',String(pid),String(price)); await send(env,m.chat.id,'✅ قیمت تغییر کرد.',[[{text:'🛍 محصول',callback_data:`admin:product:${pid}`}]]); return true;
+  }
+  if(state.startsWith('admin_ticket_reply:')){
+    const tid=Number(state.split(':')[1]); const ticket:any=await env.DB.prepare('SELECT * FROM support_tickets WHERE id=?').bind(tid).first(); if(!ticket){return true;}
+    const type=m.photo?.length?'photo':m.document?'document':'text'; const fileId=m.photo?.length?m.photo[m.photo.length-1].file_id:m.document?.file_id||null;
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO support_messages(ticket_id,sender_type,sender_telegram_id,message_type,text,file_id) VALUES(?,'admin',?,?,?,?)").bind(tid,uid,type,text||null,fileId),
+      env.DB.prepare("UPDATE support_tickets SET last_message=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(text||'[فایل]',tid),
+      env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid)
+    ]);
+    const cap=`💬 <b>پاسخ پشتیبانی</b>\n🎫 <code>${ticket.public_id}</code>\n\n${esc(text||'فایل پیوست شده')}\n\nبرای ادامه گفتگو، همین پیام را با دکمه زیر ادامه بده.`;
+    const kb={inline_keyboard:[[{text:'↩️ ادامه گفتگو',callback_data:`support:continue:${tid}`}],[{text:'🏠 منوی اصلی',callback_data:'menu'}]]};
+    if(type==='photo')await tg(env,'sendPhoto',{chat_id:ticket.telegram_id,photo:fileId,caption:cap,parse_mode:'HTML',reply_markup:kb}); else if(type==='document')await tg(env,'sendDocument',{chat_id:ticket.telegram_id,document:fileId,caption:cap,parse_mode:'HTML',reply_markup:kb}); else await tg(env,'sendMessage',{chat_id:ticket.telegram_id,text:cap,parse_mode:'HTML',reply_markup:kb});
+    await logAdmin(env,uid,'ticket_reply','ticket',ticket.public_id,text.slice(0,200)); await send(env,m.chat.id,'✅ پاسخ ارسال شد.',[[{text:'🎫 مشاهده تیکت',callback_data:`admin:ticket:view:${tid}`}]]); return true;
+  }
+  if(state==='admin_product_new_title'){
+    if(!text)return true; await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`admin_product_new_price:${encodeURIComponent(text)}`,uid).run(); await send(env,m.chat.id,'💎 قیمت محصول به Credit را بفرست. مثال: <code>0.70</code>'); return true;
+  }
+  if(state.startsWith('admin_product_new_price:')){
+    const title=decodeURIComponent(state.slice('admin_product_new_price:'.length)); const price=Number(text); if(!Number.isFinite(price)||price<0){await send(env,m.chat.id,'قیمت معتبر بفرست.');return true;}
+    await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`admin_product_new_desc:${encodeURIComponent(title)}:${price}`,uid).run(); await send(env,m.chat.id,'📝 توضیح محصول را بفرست.'); return true;
+  }
+  if(state.startsWith('admin_product_new_desc:')){
+    const raw=state.slice('admin_product_new_desc:'.length); const idx=raw.lastIndexOf(':'); const title=decodeURIComponent(raw.slice(0,idx)); const price=Number(raw.slice(idx+1));
+    const r=await env.DB.prepare("INSERT INTO products(title,description,price_credits,delivery_type,enabled,sort_order,category_id) VALUES(?,?,?,'stock',1,100,1)").bind(title,text,price).run(); const pid=r.meta.last_row_id; await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run(); await logAdmin(env,uid,'product_create','product',String(pid),title); await send(env,m.chat.id,`✅ محصول ساخته شد. ID: <code>${pid}</code>`,[[{text:'📦 افزودن استوک',callback_data:`admin:stock:add:${pid}`}],[{text:'🛍 مشاهده محصول',callback_data:`admin:product:${pid}`}]]); return true;
+  }
+  if(state.startsWith('admin_setting:')){
+    const key=state.split(':')[1]; if(!text){await send(env,m.chat.id,'مقدار نمی‌تواند خالی باشد. برای غیرفعال‌کردن عبارت <code>OFF</code> را بفرست.');return true;}
+    await setSetting(env,key,text.toUpperCase()==='OFF'?'':text); await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run(); await logAdmin(env,uid,'payment_setting','setting',key,'updated'); await send(env,m.chat.id,'✅ تنظیم ذخیره شد.',[[{text:'💳 تنظیمات پرداخت',callback_data:'admin:payments'}]]); return true;
+  }
+  if(state==='admin_category_new'){
+    const parts=text.split(/\s+/); let emoji='🛍',title=text;if(parts.length>1&&/[^\w\u0600-\u06FF]/u.test(parts[0])){emoji=parts.shift()!;title=parts.join(' ');} if(!title){await send(env,m.chat.id,'نام دسته را بفرست.');return true;}
+    const r=await env.DB.prepare('INSERT INTO shop_categories(title,emoji,enabled,sort_order) VALUES(?,?,1,100)').bind(title,emoji).run();await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run();await logAdmin(env,uid,'category_create','category',String(r.meta.last_row_id),title);await send(env,m.chat.id,'✅ دسته ساخته شد.',[[{text:'🗂 دسته‌بندی‌ها',callback_data:'admin:categories'}]]);return true;
+  }
+  if(state==='admin_channel_new_chat'){
+    await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`admin_channel_new_title:${encodeURIComponent(text)}`,uid).run();await send(env,m.chat.id,'📝 عنوان نمایشی کانال را بفرست.');return true;
+  }
+  if(state.startsWith('admin_channel_new_title:')){
+    const chatId=decodeURIComponent(state.slice('admin_channel_new_title:'.length));await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`admin_channel_new_url:${encodeURIComponent(chatId)}:${encodeURIComponent(text)}`,uid).run();await send(env,m.chat.id,'🔗 لینک Join را بفرست. مثال: <code>https://t.me/YourChannel</code>');return true;
+  }
+  if(state.startsWith('admin_channel_new_url:')){
+    const raw=state.slice('admin_channel_new_url:'.length);const i=raw.indexOf(':');const chatId=decodeURIComponent(raw.slice(0,i));const title=decodeURIComponent(raw.slice(i+1));
+    await env.DB.prepare('INSERT OR REPLACE INTO required_channels(chat_id,title,join_url,enabled,sort_order) VALUES(?,?,?,1,100)').bind(chatId,title,text).run();await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run();await logAdmin(env,uid,'channel_save','channel',chatId,title);await send(env,m.chat.id,'✅ کانال جوین اجباری ذخیره شد.',[[{text:'📢 کانال‌ها',callback_data:'admin:channels'}]]);return true;
+  }
+  if(state==='admin_discount_new'){
+    const p=text.split(/\s+/);if(p.length<3){await send(env,m.chat.id,'فرمت صحیح:\n<code>CODE percent 10 0 100</code>\nیا\n<code>CODE fixed 2 5 50</code>\n\nبه‌ترتیب: کد، نوع، مقدار، حداقل خرید (اختیاری)، سقف استفاده (اختیاری)');return true;}
+    const code=p[0].toUpperCase(),type=p[1].toLowerCase(),value=Number(p[2]),min=Number(p[3]||0),max=p[4]?Number(p[4]):null;if(!['percent','fixed'].includes(type)||!Number.isFinite(value)||value<=0){await send(env,m.chat.id,'نوع باید percent یا fixed و مقدار مثبت باشد.');return true;}
+    try{await env.DB.prepare('INSERT INTO discount_codes(code,discount_type,value,min_total,max_uses,enabled) VALUES(?,?,?,?,?,1)').bind(code,type,value,min,max).run();}catch{await send(env,m.chat.id,'❌ این کد احتمالاً قبلاً وجود دارد.');return true;}await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run();await logAdmin(env,uid,'discount_create','discount',code,`${type}:${value}`);await send(env,m.chat.id,'✅ کد تخفیف ساخته شد.',[[{text:'🏷 کدهای تخفیف',callback_data:'admin:discounts'}]]);return true;
+  }
+  return false;
+}
+
+async function handleMessage(env:Env,m:Message){
+  if(!m.from)return; const uid=m.from.id; const text=m.text||'';
+  let startParam:string|undefined; if(text.startsWith('/start'))startParam=text.split(' ')[1]; await upsertUser(env,m.from,startParam);
+  if(text.startsWith('/start')){if(await joinGate(env,uid,m.chat.id))return; await showMenu(env,m.chat.id);return;}
+  if(text==='/admin'&&isAdmin(env,uid)){await showAdmin(env,m.chat.id);return;}
+  if(await joinGate(env,uid,m.chat.id))return;
+  const u:any=await env.DB.prepare('SELECT state FROM users WHERE telegram_id=?').bind(uid).first(); const state=String(u?.state||'');
+  if(state&&isAdmin(env,uid)&&await handleAdminState(env,m,state))return;
+  if(state.startsWith('await_card_receipt:')&&(m.photo?.length||m.document)){
+    const pub=state.split(':')[1]; const inv:any=await env.DB.prepare("SELECT * FROM payment_invoices WHERE public_id=? AND telegram_id=? AND status='awaiting_receipt'").bind(pub,uid).first();
+    if(!inv){await send(env,m.chat.id,'این فاکتور دیگر قابل ارسال نیست.');return;}
+    const isDoc=!!m.document; const fileId=isDoc?m.document!.file_id:m.photo![m.photo!.length-1].file_id;
+    await env.DB.batch([env.DB.prepare("UPDATE payment_invoices SET status='manual_review',receipt_file_id=? WHERE id=?").bind(fileId,inv.id),env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid)]); await notifyAdminsCardReceipt(env,inv,m.from,fileId,isDoc);
+    await send(env,m.chat.id,`✅ رسید فاکتور <code>${pub}</code> دریافت شد.\nپس از بررسی ادمین نتیجه همین‌جا اعلام می‌شود.`,[[{text:'🏠 منوی اصلی',callback_data:'menu'}]]);return;
+  }
+  if(state==='await_custom_credit'&&/^\d+(\.\d+)?$/.test(text.trim())){
+    const usd=Number(text); if(usd<=0||usd>10000){await send(env,m.chat.id,'مبلغ معتبر وارد کن.');return;} const credits=usd/Number(env.CREDIT_USD_PRICE||1); await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run(); const mm=await send(env,m.chat.id,'در حال آماده‌سازی...'); await paymentMethods(env,m.chat.id,mm.result.message_id,usd,credits);return;
+  }
+  if(state.startsWith('await_discount:')){
+    const [,pidRaw,qtyRaw]=state.split(':'); const pid=Number(pidRaw),qty=Number(qtyRaw); const code=text.trim().toUpperCase(); const p:any=await env.DB.prepare('SELECT price_credits FROM products WHERE id=? AND enabled=1').bind(pid).first(); const subtotal=Number(p?.price_credits||0)*qty;
+    const d:any=await env.DB.prepare("SELECT * FROM discount_codes WHERE code=? COLLATE NOCASE AND enabled=1 AND (expires_at IS NULL OR datetime(expires_at)>datetime('now'))").bind(code).first();
+    if(!d||Number(d.min_total||0)>subtotal||(d.max_uses!==null&&Number(d.uses_count)>=Number(d.max_uses))){await send(env,m.chat.id,'❌ کد تخفیف معتبر نیست یا شرایط استفاده را ندارد.');return;}
+    await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run(); const mm=await send(env,m.chat.id,'✅ کد اعمال شد.'); await showOrderSummary(env,uid,m.chat.id,mm.result.message_id,pid,qty,Number(d.id));return;
+  }
+  if(state.startsWith('await_ticket:')){await createTicketFromMessage(env,m,state);return;}
+  if(state.startsWith('ticket_continue:')){
+    const tid=Number(state.split(':')[1]); const t:any=await env.DB.prepare('SELECT * FROM support_tickets WHERE id=? AND telegram_id=?').bind(tid,uid).first(); if(t){await forwardUserTicketMessage(env,m,t); await send(env,m.chat.id,'✅ پیام به پشتیبانی ارسال شد.');return;}
+  }
+  await showMenu(env,m.chat.id);
+}
+
+async function handleCallback(env:Env,c:CallbackQuery){
+  if(!c.message||!c.data)return; const uid=c.from.id,chat=c.message.chat.id,mid=c.message.message_id,d=c.data; await upsertUser(env,c.from);
+  if(d==='join:check'){
+    const missing=await checkJoin(env,uid); if(missing.length){await answerCb(env,c.id,'هنوز عضویت همه کانال‌ها تأیید نشده.',true);await joinGate(env,uid,chat,mid);return;} await answerCb(env,c.id,'عضویت تأیید شد ✅'); await env.DB.prepare('UPDATE users SET join_verified=1 WHERE telegram_id=?').bind(uid).run(); await qualifyReferral(env,uid); await showMenu(env,chat,mid);return;
+  }
+  if(await joinGate(env,uid,chat,mid)){await answerCb(env,c.id);return;} await answerCb(env,c.id);
+  if(d==='menu'){await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run();return showMenu(env,chat,mid);}
+  if(d==='balance')return showBalance(env,uid,chat,mid);
+  if(d==='credit:buy')return showCreditPackages(env,chat,mid);
+  if(d==='credit:custom'){await env.DB.prepare("UPDATE users SET state='await_custom_credit' WHERE telegram_id=?").bind(uid).run();return edit(env,chat,mid,'✏️ مبلغ دلخواه را به دلار وارد کن.\nمثال: <code>27</code>',[[{text:'⬅️ بازگشت',callback_data:'credit:buy'}]]);}
+  if(d.startsWith('credit:pkg:')){const id=Number(d.split(':')[2]); const p:any=await env.DB.prepare('SELECT * FROM credit_packages WHERE id=? AND enabled=1').bind(id).first(); if(p)return paymentMethods(env,chat,mid,Number(p.pay_usd),Number(p.credits));}
+  if(d.startsWith('pay:crypto:')){const parts=d.split(':');const network=parts[2],usd=Number(parts[3]),cr=Number(parts[4]);return showCryptoInvoice(env,chat,mid,uid,usd,cr,network);}
+  if(d.startsWith('pay:card:')){const parts=d.split(':');const usd=Number(parts[2]),cr=Number(parts[3]);return showCardInvoice(env,chat,mid,uid,usd,cr);}
+  if(d.startsWith('pay:qr:')){await showPaymentQr(env,chat,d.split(':')[2]);return;}
+  if(d.startsWith('pay:check:')){const pub=d.split(':')[2]; const n=await scanPendingCrypto(env,pub); if(n){await answerCb(env,c.id,'پرداخت تأیید شد ✅',true);return showBalance(env,uid,chat,mid);} return answerCb(env,c.id,'هنوز تراکنش مطابق فاکتور پیدا نشده.',true);}
+  if(d.startsWith('pay:cancel:')){const pub=d.split(':')[2]; await env.DB.prepare("UPDATE payment_invoices SET status='cancelled' WHERE public_id=? AND telegram_id=? AND status IN ('pending','awaiting_receipt')").bind(pub,uid).run(); await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run(); return showMenu(env,chat,mid);}
+  if(d==='shop:list')return showShop(env,chat,mid);
+  if(d.startsWith('shop:cat:')){const x=d.split(':');return showCategoryProducts(env,chat,mid,Number(x[2]),Number(x[3])||0);}
+  if(d.startsWith('shop:p:'))return showProduct(env,chat,mid,Number(d.split(':')[2]));
+  if(d.startsWith('shop:summary:')){const x=d.split(':');return showOrderSummary(env,uid,chat,mid,Number(x[2]),Number(x[3]),Number(x[4])||0);}
+  if(d.startsWith('shop:discount:')){const x=d.split(':');await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`await_discount:${x[2]}:${x[3]}`,uid).run();return edit(env,chat,mid,'🏷 <b>کد تخفیف را ارسال کن</b>\n\nکد را بدون فاصله اضافی بفرست.',[[{text:'⬅️ بازگشت',callback_data:`shop:summary:${x[2]}:${x[3]}:0`}]]);}
+  if(d.startsWith('shop:buy:')){const x=d.split(':');return buyProduct(env,uid,chat,mid,Number(x[2]),Number(x[3]),Number(x[4])||0);}
+  if(d==='history:menu')return showHistoryMenu(env,chat,mid);
+  if(d.startsWith('history:shop:'))return showShopHistory(env,uid,chat,mid,Number(d.split(':')[2])||0);
+  if(d.startsWith('history:pay:'))return showPaymentHistory(env,uid,chat,mid,Number(d.split(':')[2])||0);
+  if(d==='referral')return showReferral(env,uid,chat,mid);
+  if(d==='status')return edit(env,chat,mid,'🟢 <b>وضعیت سرویس</b>\n\n🟢 Telegram Bot\n🟢 Cloudflare Worker\n🟢 D1 Database\n🟢 Shop Engine\n🟢 Payment Scanner\n🟢 Support Tickets',[[{text:'⬅️ منوی اصلی',callback_data:'menu'}]]);
+  if(d==='support:menu'){await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run();return showSupportMenu(env,chat,mid);}
+  if(d==='support:orders')return showSupportOrders(env,uid,chat,mid);
+  if(d.startsWith('support:new:'))return beginTicket(env,uid,chat,mid,d.split(':')[2]);
+  if(d.startsWith('support:order:'))return beginTicket(env,uid,chat,mid,'shop',Number(d.split(':')[2]));
+  if(d==='support:mine')return showMyTickets(env,uid,chat,mid);
+  if(d==='support:cancel'){await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run();return showSupportMenu(env,chat,mid);}
+  if(d.startsWith('support:continue:')){const tid=Number(d.split(':')[2]); const t:any=await env.DB.prepare('SELECT id FROM support_tickets WHERE id=? AND telegram_id=?').bind(tid,uid).first(); if(!t)return; await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`ticket_continue:${tid}`,uid).run(); return edit(env,chat,mid,'✍️ پیام بعدی را بفرست. متن، عکس یا فایل قابل ارسال است.',[[{text:'⬅️ پشتیبانی',callback_data:'support:menu'}]]);}
+
+  if(!isAdmin(env,uid))return;
+  if(d==='admin:home'){await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run();return showAdmin(env,chat,mid);}
+  if(d==='admin:scan'){const n=await scanPendingCrypto(env); await logAdmin(env,uid,'crypto_scan',undefined,undefined,`settled=${n}`);return answerCb(env,c.id,`${n} پرداخت جدید تأیید شد.`,true);}
+  if(d==='admin:products')return adminProducts(env,chat,mid);
+  if(d==='admin:categories')return adminCategories(env,chat,mid);
+  if(d==='admin:channels')return adminChannels(env,chat,mid);
+  if(d==='admin:discounts')return adminDiscounts(env,chat,mid);
+  if(d==='admin:payments')return adminPayments(env,chat,mid);
+  if(d==='admin:orders')return adminOrders(env,chat,mid);
+  if(d.startsWith('admin:order:refund:')){const id=Number(d.split(':')[3]);const o=await refundOrder(env,uid,id);if(!o)return answerCb(env,c.id,'این سفارش قابل Refund نیست.',true);await answerCb(env,c.id,'Refund انجام شد ✅',true);return adminOrderDetail(env,chat,mid,id);}
+  if(d.startsWith('admin:order:'))return adminOrderDetail(env,chat,mid,Number(d.split(':')[2]));
+  if(d==='admin:category:new'){await env.DB.prepare("UPDATE users SET state='admin_category_new' WHERE telegram_id=?").bind(uid).run();return edit(env,chat,mid,'➕ نام دسته را بفرست. می‌توانی اولش ایموجی هم بگذاری.\nمثال: <code>🤖 هوش مصنوعی</code>',[[{text:'⬅️ لغو',callback_data:'admin:categories'}]]);}
+  if(d.startsWith('admin:category:toggle:')){const id=Number(d.split(':')[3]);await env.DB.prepare('UPDATE shop_categories SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=?').bind(id).run();await logAdmin(env,uid,'category_toggle','category',String(id));return adminCategories(env,chat,mid);}
+  if(d.startsWith('admin:product:category:'))return adminProductCategory(env,chat,mid,Number(d.split(':')[3]));
+  if(d.startsWith('admin:product:setcat:')){const x=d.split(':');const pid=Number(x[3]),cid=Number(x[4]);await env.DB.prepare('UPDATE products SET category_id=? WHERE id=?').bind(cid,pid).run();await logAdmin(env,uid,'product_category','product',String(pid),`category=${cid}`);return adminProductDetail(env,chat,mid,pid);}
+  if(d==='admin:channel:new'){await env.DB.prepare("UPDATE users SET state='admin_channel_new_chat' WHERE telegram_id=?").bind(uid).run();return edit(env,chat,mid,'📢 Chat ID کانال/گروه را بفرست.\nمثال: <code>-1001234567890</code>',[[{text:'⬅️ لغو',callback_data:'admin:channels'}]]);}
+  if(d.startsWith('admin:channel:toggle:')){const id=Number(d.split(':')[3]);await env.DB.prepare('UPDATE required_channels SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=?').bind(id).run();await logAdmin(env,uid,'channel_toggle','channel',String(id));return adminChannels(env,chat,mid);}
+  if(d.startsWith('admin:channel:delete:')){const id=Number(d.split(':')[3]);await env.DB.prepare('DELETE FROM required_channels WHERE id=?').bind(id).run();await logAdmin(env,uid,'channel_delete','channel',String(id));return adminChannels(env,chat,mid);}
+  if(d==='admin:discount:new'){await env.DB.prepare("UPDATE users SET state='admin_discount_new' WHERE telegram_id=?").bind(uid).run();return edit(env,chat,mid,'🏷 مشخصات کد را در یک خط بفرست.\n\n<code>WELCOME percent 10 5 100</code>\nیا\n<code>SAVE2 fixed 2 5 50</code>\n\nترتیب: CODE / type / value / min-total / max-uses',[[{text:'⬅️ لغو',callback_data:'admin:discounts'}]]);}
+  if(d.startsWith('admin:discount:toggle:')){const id=Number(d.split(':')[3]);await env.DB.prepare('UPDATE discount_codes SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=?').bind(id).run();await logAdmin(env,uid,'discount_toggle','discount',String(id));return adminDiscounts(env,chat,mid);}
+  if(d.startsWith('admin:payset:')){const key=d.split(':')[2];await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`admin_setting:${key}`,uid).run();return edit(env,chat,mid,`✏️ مقدار جدید <code>${esc(key)}</code> را بفرست.\nبرای غیرفعال‌کردن <code>OFF</code> بفرست.`,[[{text:'⬅️ لغو',callback_data:'admin:payments'}]]);}
+  if(d==='admin:tonrate:auto'){await setSetting(env,'ton_rate_mode','auto');await refreshTonRate(env,true);await logAdmin(env,uid,'ton_rate_mode','setting','ton_rate_mode','auto');return adminPayments(env,chat,mid);}
+  if(d==='admin:tonrate:manual'){await setSetting(env,'ton_rate_mode','manual');await logAdmin(env,uid,'ton_rate_mode','setting','ton_rate_mode','manual');return adminPayments(env,chat,mid);}
+  if(d==='admin:tonrate:refresh'){const r=await refreshTonRate(env,true);await answerCb(env,c.id,r?`نرخ جدید: $${r}`:'دریافت نرخ ناموفق بود.',!r);return adminPayments(env,chat,mid);}
+  if(d.startsWith('admin:product:toggle:')){const pid=Number(d.split(':')[3]); await env.DB.prepare('UPDATE products SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=?').bind(pid).run(); await logAdmin(env,uid,'product_toggle','product',String(pid)); return adminProductDetail(env,chat,mid,pid);}
+  if(d.startsWith('admin:product:price:')){const pid=Number(d.split(':')[3]); await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`admin_price:${pid}`,uid).run(); return edit(env,chat,mid,'💎 قیمت جدید را به Credit بفرست. مثال: <code>0.70</code>',[[{text:'⬅️ لغو',callback_data:`admin:product:${pid}`}]]);}
+  if(d==='admin:product:new'){await env.DB.prepare("UPDATE users SET state='admin_product_new_title' WHERE telegram_id=?").bind(uid).run(); return edit(env,chat,mid,'➕ <b>محصول جدید</b>\n\nنام محصول را بفرست.',[[{text:'⬅️ لغو',callback_data:'admin:products'}]]);}
+  if(d.startsWith('admin:product:'))return adminProductDetail(env,chat,mid,Number(d.split(':')[2]));
+  if(d==='admin:stock')return adminStock(env,chat,mid);
+  if(d.startsWith('admin:stock:add:')){const pid=Number(d.split(':')[3]); await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`admin_stock:${pid}`,uid).run(); return edit(env,chat,mid,'📦 استوک‌ها را بفرست؛ <b>هر مورد در یک خط</b>.\n\nمثال:\n<code>LINK-1\nLINK-2\nLINK-3</code>',[[{text:'⬅️ لغو',callback_data:`admin:product:${pid}`}]]);}
+  if(d==='admin:tickets')return adminTickets(env,chat,mid);
+  if(d.startsWith('admin:ticket:view:'))return adminTicketView(env,chat,mid,Number(d.split(':')[3]));
+  if(d.startsWith('admin:ticket:reply:')){const tid=Number(d.split(':')[3]); await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`admin_ticket_reply:${tid}`,uid).run(); return edit(env,chat,mid,'💬 پاسخ را بفرست. متن، عکس یا فایل قابل ارسال است.',[[{text:'⬅️ لغو',callback_data:`admin:ticket:view:${tid}`}]]);}
+  if(d.startsWith('admin:ticket:close:')){const tid=Number(d.split(':')[3]); const t:any=await env.DB.prepare('SELECT * FROM support_tickets WHERE id=?').bind(tid).first(); if(t){await env.DB.prepare("UPDATE support_tickets SET status='closed',updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(tid).run(); await send(env,t.telegram_id,`✅ تیکت <code>${t.public_id}</code> توسط پشتیبانی بسته شد.`); await logAdmin(env,uid,'ticket_close','ticket',t.public_id);} return adminTickets(env,chat,mid);}
+  if(d==='admin:broadcast'){await env.DB.prepare("UPDATE users SET state='admin_broadcast' WHERE telegram_id=?").bind(uid).run(); return edit(env,chat,mid,'📢 متن Broadcast را بفرست.\n\nپیام در صف قرار می‌گیرد و Cron آن را مرحله‌ای ارسال می‌کند.',[[{text:'⬅️ لغو',callback_data:'admin:home'}]]);}
+  if(d==='admin:stats')return adminStats(env,chat,mid);
+  if(d.startsWith('admin:card:')){
+    const [, ,action,pub]=d.split(':'); const inv:any=await env.DB.prepare("SELECT * FROM payment_invoices WHERE public_id=? AND method='card' AND status='manual_review'").bind(pub).first(); if(!inv)return answerCb(env,c.id,'این درخواست قبلاً بررسی شده.',true);
+    if(action==='approve'){
+      const upd=await env.DB.prepare("UPDATE payment_invoices SET status='paid',paid_at=CURRENT_TIMESTAMP,reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP WHERE id=? AND status='manual_review'").bind(uid,inv.id).run();
+      if(upd.meta.changes){await env.DB.prepare("INSERT INTO credit_ledger(telegram_id,amount,kind,ref_type,ref_id,note) VALUES(?,?,'topup','payment',?,'شارژ با کارت به کارت')").bind(inv.telegram_id,inv.credit_amount,inv.public_id).run(); await send(env,inv.telegram_id,`✅ پرداخت کارت به کارت <code>${pub}</code> تأیید شد.\n💎 ${Number(inv.credit_amount).toFixed(2)} Credit اضافه شد.`,[[{text:'💰 موجودی',callback_data:'balance'}]]); await logAdmin(env,uid,'card_approve','payment',pub);}
+      return answerCb(env,c.id,'تأیید شد ✅',true);
+    }
+    await env.DB.prepare("UPDATE payment_invoices SET status='rejected',reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP WHERE id=?").bind(uid,inv.id).run(); await send(env,inv.telegram_id,`❌ رسید فاکتور <code>${pub}</code> توسط ادمین تأیید نشد.\nدر صورت نیاز با پشتیبانی تماس بگیر.`); await logAdmin(env,uid,'card_reject','payment',pub); return answerCb(env,c.id,'رد شد.',true);
+  }
+}
+
+async function handleUpdate(env:Env,u:Update){if(u.message)await handleMessage(env,u.message); else if(u.callback_query)await handleCallback(env,u.callback_query)}
+
+
+function webEsc(v:any=''){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c] as string));}
+function cookieValue(req:Request,name:string){
+  const raw=req.headers.get('cookie')||''; for(const part of raw.split(';')){const i=part.indexOf('=');if(i<0)continue;if(part.slice(0,i).trim()===name)return decodeURIComponent(part.slice(i+1).trim());} return '';
+}
+async function hmacHex(secret:string,text:string){
+  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(secret),{name:'HMAC',hash:'SHA-256'},false,['sign']);
+  const sig=new Uint8Array(await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(text))); return Array.from(sig).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+function safeEq(a:string,b:string){if(a.length!==b.length)return false;let x=0;for(let i=0;i<a.length;i++)x|=a.charCodeAt(i)^b.charCodeAt(i);return x===0;}
+async function makeAdminSession(env:Env){const exp=Date.now()+7*24*60*60*1000;const payload=String(exp);const sig=await hmacHex(env.ADMIN_SESSION_SECRET||'',payload);return `${payload}.${sig}`;}
+async function validAdminSession(req:Request,env:Env){
+  if(!env.ADMIN_WEB_PASSWORD||!env.ADMIN_SESSION_SECRET)return false; const token=cookieValue(req,'nexora_admin'); if(!token)return false; const [payload,sig]=token.split('.'); if(!payload||!sig||Number(payload)<Date.now())return false; const expected=await hmacHex(env.ADMIN_SESSION_SECRET,payload); return safeEq(sig,expected);
+}
+function webPage(title:string,body:string,active='dashboard'){
+  const nav=(id:string,label:string)=>`<a class="${active===id?'active':''}" href="/admin-web?tab=${id}">${label}</a>`;
+  return `<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${webEsc(title)} · Nexora</title><style>
+  :root{color-scheme:dark;--bg:#0b1020;--panel:#121a2d;--muted:#91a0bd;--line:#24314e;--accent:#7aa2ff;--good:#46d39a;--bad:#ff6b7a}*{box-sizing:border-box}body{margin:0;background:linear-gradient(160deg,#090e1c,#11192d);color:#f4f7ff;font-family:system-ui,-apple-system,Segoe UI,Tahoma,sans-serif}.wrap{max-width:1180px;margin:auto;padding:22px}.top{display:flex;gap:14px;align-items:center;justify-content:space-between;margin-bottom:18px}.brand{font-weight:800;font-size:20px}.sub{color:var(--muted);font-size:13px}.nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 18px}.nav a,.btn{color:#edf3ff;text-decoration:none;background:#17223c;border:1px solid var(--line);padding:9px 12px;border-radius:11px;cursor:pointer}.nav a.active{border-color:var(--accent);background:#20325b}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.card{background:rgba(18,26,45,.94);border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:0 12px 30px #0003}.metric{font-size:25px;font-weight:800;margin-top:6px}.muted{color:var(--muted)}table{width:100%;border-collapse:collapse;margin-top:10px}th,td{padding:10px 8px;border-bottom:1px solid var(--line);text-align:right;vertical-align:top}input,textarea,select{width:100%;background:#0d1528;color:#fff;border:1px solid var(--line);border-radius:10px;padding:10px}textarea{min-height:110px}.row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.field{margin-bottom:12px}.field label{display:block;margin-bottom:6px;color:#cbd6ec;font-size:13px}.btn.primary{background:#2b4f91;border-color:#4c75c5}.btn.good{background:#174837;border-color:#2c8a67}.btn.bad{background:#52202a;border-color:#93404f}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#1a2947;font-size:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.ltr{direction:ltr;text-align:left}@media(max-width:700px){.row{grid-template-columns:1fr}.wrap{padding:12px}th:nth-child(n+5),td:nth-child(n+5){display:none}}
+  </style></head><body><div class="wrap"><div class="top"><div><div class="brand">Nexora Commerce Bot</div><div class="sub">پنل مدیریت تحت وب</div></div><form method="post" action="/admin-web"><input type="hidden" name="action" value="logout"><button class="btn bad">خروج</button></form></div><div class="nav">${nav('dashboard','📊 داشبورد')}${nav('products','🛍 محصولات')}${nav('users','👥 کاربران')}${nav('orders','🧾 سفارش‌ها')}${nav('payments','💳 پرداخت و TON')}</div>${body}</div></body></html>`;
+}
+function loginPage(msg=''){
+  return new Response(`<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Nexora Admin</title><style>body{margin:0;background:#0b1020;color:#fff;font-family:system-ui;display:grid;place-items:center;min-height:100vh}.box{width:min(92vw,420px);background:#121a2d;border:1px solid #263454;border-radius:18px;padding:24px}input,button{width:100%;padding:12px;border-radius:10px;border:1px solid #314267;background:#0c1427;color:#fff;margin-top:10px}button{background:#315da8;cursor:pointer}.err{color:#ff8793}</style><div class="box"><h2>ورود به Nexora Admin</h2><p>رمز پنل مدیریت را وارد کن.</p>${msg?`<p class="err">${webEsc(msg)}</p>`:''}<form method="post" action="/admin-web"><input type="hidden" name="action" value="login"><input type="password" name="password" autocomplete="current-password" required><button>ورود</button></form></div></html>`,{headers:{'content-type':'text/html; charset=utf-8'}});
+}
+async function adminDashboardHtml(env:Env){
+  const [users,orders,topups,tickets,stock,periods]=await Promise.all([
+    env.DB.prepare('SELECT COUNT(*) c FROM users').first<any>(),
+    env.DB.prepare("SELECT COUNT(*) c,COALESCE(SUM(total_price),0) revenue,COALESCE(SUM(cost_total),0) cost FROM orders WHERE status='completed'").first<any>(),
+    env.DB.prepare("SELECT COUNT(*) c,COALESCE(SUM(requested_usd),0) usd FROM payment_invoices WHERE status='paid'").first<any>(),
+    env.DB.prepare("SELECT COUNT(*) c FROM support_tickets WHERE status='open'").first<any>(),
+    env.DB.prepare("SELECT COUNT(*) c FROM product_stock WHERE status='available'").first<any>(),
+    env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN date(created_at)=date('now') THEN total_price ELSE 0 END),0) today_revenue,COALESCE(SUM(CASE WHEN date(created_at)=date('now') THEN cost_total ELSE 0 END),0) today_cost,COALESCE(SUM(CASE WHEN datetime(created_at)>=datetime('now','-7 days') THEN total_price ELSE 0 END),0) week_revenue,COALESCE(SUM(CASE WHEN datetime(created_at)>=datetime('now','-7 days') THEN cost_total ELSE 0 END),0) week_cost,COALESCE(SUM(CASE WHEN datetime(created_at)>=datetime('now','-30 days') THEN total_price ELSE 0 END),0) month_revenue,COALESCE(SUM(CASE WHEN datetime(created_at)>=datetime('now','-30 days') THEN cost_total ELSE 0 END),0) month_cost FROM orders WHERE status='completed'").first<any>()
+  ]);
+  const gross=Number(orders?.revenue||0),cost=Number(orders?.cost||0),profit=gross-cost;
+  const row=(label:string,revenue:any,costv:any)=>`<tr><td>${label}</td><td>${Number(revenue||0).toFixed(2)}</td><td>${Number(costv||0).toFixed(2)}</td><td>${(Number(revenue||0)-Number(costv||0)).toFixed(2)}</td></tr>`;
+  return `<div class="grid"><div class="card"><div class="muted">کاربران</div><div class="metric">${Number(users?.c||0)}</div></div><div class="card"><div class="muted">سفارش تکمیل‌شده</div><div class="metric">${Number(orders?.c||0)}</div></div><div class="card"><div class="muted">فروش خالص</div><div class="metric">${gross.toFixed(2)} cr</div></div><div class="card"><div class="muted">سود تخمینی</div><div class="metric">${profit.toFixed(2)} cr</div></div><div class="card"><div class="muted">شارژهای تأییدشده</div><div class="metric">$${Number(topups?.usd||0).toFixed(2)}</div></div><div class="card"><div class="muted">تیکت باز / استوک</div><div class="metric">${Number(tickets?.c||0)} / ${Number(stock?.c||0)}</div></div></div><div class="card" style="margin-top:14px"><h3>عملکرد زمانی</h3><table><tr><th>بازه</th><th>فروش</th><th>هزینه</th><th>سود تخمینی</th></tr>${row('امروز',periods?.today_revenue,periods?.today_cost)}${row('۷ روز اخیر',periods?.week_revenue,periods?.week_cost)}${row('۳۰ روز اخیر',periods?.month_revenue,periods?.month_cost)}</table><p class="muted">سود = مبلغ فروش پس از تخفیف − هزینه ثبت‌شده محصول در زمان سفارش. برای سفارش‌های قدیمی قبل از v0.4، هزینه تاریخی ممکن است صفر باشد.</p></div>`;
+}
+async function adminProductsHtml(env:Env,url:URL){
+  const editId=Number(url.searchParams.get('edit')||0); const cats:any=await env.DB.prepare('SELECT * FROM shop_categories ORDER BY sort_order,id').all();
+  let editor='';
+  if(editId){const p:any=await env.DB.prepare('SELECT * FROM products WHERE id=?').bind(editId).first();if(p){editor=`<div class="card"><h3>ویرایش محصول #${p.id}</h3><form method="post" action="/admin-web"><input type="hidden" name="action" value="product_save"><input type="hidden" name="id" value="${p.id}"><div class="row"><div class="field"><label>نام</label><input name="title" value="${webEsc(p.title)}" required></div><div class="field"><label>دسته</label><select name="category_id">${(cats.results||[]).map((c:any)=>`<option value="${c.id}" ${Number(c.id)===Number(p.category_id)?'selected':''}>${webEsc(c.emoji)} ${webEsc(c.title)}</option>`).join('')}</select></div></div><div class="field"><label>توضیحات</label><textarea name="description">${webEsc(p.description||'')}</textarea></div><div class="row"><div class="field"><label>قیمت فروش (Credit)</label><input type="number" step="0.0001" min="0" name="price_credits" value="${Number(p.price_credits)}"></div><div class="field"><label>هزینه تمام‌شده (Credit)</label><input type="number" step="0.0001" min="0" name="cost_credits" value="${Number(p.cost_credits||0)}"></div></div><div class="row"><div class="field"><label>گارانتی</label><input name="warranty_text" value="${webEsc(p.warranty_text||'')}"></div><div class="field"><label>فرمت تحویل</label><input name="format_text" value="${webEsc(p.format_text||'')}"></div></div><div class="row"><div class="field"><label>ترتیب</label><input type="number" name="sort_order" value="${Number(p.sort_order||100)}"></div><div class="field"><label>وضعیت</label><select name="enabled"><option value="1" ${p.enabled?'selected':''}>فعال</option><option value="0" ${!p.enabled?'selected':''}>غیرفعال</option></select></div></div><button class="btn primary">ذخیره تغییرات</button></form></div>`;}}
+  const q:any=await env.DB.prepare("SELECT p.*,c.title category_title,(SELECT COUNT(*) FROM product_stock s WHERE s.product_id=p.id AND s.status='available') stock FROM products p LEFT JOIN shop_categories c ON c.id=p.category_id ORDER BY p.id DESC LIMIT 100").all();
+  const rows=(q.results||[]).map((p:any)=>`<tr><td>${p.id}</td><td>${webEsc(p.title)}</td><td>${Number(p.price_credits).toFixed(2)}</td><td>${Number(p.cost_credits||0).toFixed(2)}</td><td>${Number(p.stock||0)}</td><td>${p.enabled?'🟢':'⚪'}</td><td><a class="btn" href="/admin-web?tab=products&edit=${p.id}">ویرایش</a></td></tr>`).join('');
+  return `${editor}<div class="card" style="margin-top:14px"><div class="actions"><h3 style="margin-left:auto">محصولات</h3><a class="btn good" href="/admin-web?tab=products&new=1">➕ ساخت محصول</a></div>${url.searchParams.get('new')?`<form method="post" action="/admin-web"><input type="hidden" name="action" value="product_create"><div class="row"><div class="field"><label>نام</label><input name="title" required></div><div class="field"><label>دسته</label><select name="category_id">${(cats.results||[]).map((c:any)=>`<option value="${c.id}">${webEsc(c.emoji)} ${webEsc(c.title)}</option>`).join('')}</select></div></div><div class="row"><div class="field"><label>قیمت فروش</label><input type="number" step="0.0001" min="0" name="price_credits" required></div><div class="field"><label>هزینه تمام‌شده</label><input type="number" step="0.0001" min="0" name="cost_credits" value="0"></div></div><div class="field"><label>توضیحات</label><textarea name="description"></textarea></div><button class="btn good">ساخت</button></form>`:''}<table><tr><th>ID</th><th>محصول</th><th>فروش</th><th>هزینه</th><th>استوک</th><th>وضعیت</th><th></th></tr>${rows}</table></div>`;
+}
+async function adminUsersHtml(env:Env,url:URL){
+  const q=(url.searchParams.get('q')||'').trim(); const detail=Number(url.searchParams.get('id')||0); let detailHtml='';
+  if(detail){const u:any=await env.DB.prepare('SELECT * FROM users WHERE telegram_id=?').bind(detail).first();if(u){const b=await balance(env,detail);const lg:any=await env.DB.prepare('SELECT * FROM credit_ledger WHERE telegram_id=? ORDER BY id DESC LIMIT 20').bind(detail).all();detailHtml=`<div class="card"><h3>${webEsc(u.first_name||'کاربر')} ${u.username?'@'+webEsc(u.username):''}</h3><p class="muted ltr">Telegram ID: ${u.telegram_id}</p><div class="metric">${b.total.toFixed(2)} Credit</div><form method="post" action="/admin-web" style="margin-top:14px"><input type="hidden" name="action" value="balance_adjust"><input type="hidden" name="telegram_id" value="${u.telegram_id}"><div class="row"><div class="field"><label>مقدار تغییر (+ یا -)</label><input type="number" step="0.0001" name="amount" required></div><div class="field"><label>توضیح</label><input name="note" placeholder="اصلاح موجودی"></div></div><button class="btn primary">ثبت تغییر موجودی</button></form><h4>آخرین گردش‌ها</h4><table><tr><th>مقدار</th><th>نوع</th><th>توضیح</th><th>زمان</th></tr>${(lg.results||[]).map((x:any)=>`<tr><td>${Number(x.amount).toFixed(2)}</td><td>${webEsc(x.kind)}</td><td>${webEsc(x.note||'')}</td><td>${webEsc(x.created_at)}</td></tr>`).join('')}</table></div>`;}}
+  let stmt:any;if(q){const like=`%${q.replace(/^@/,'')}%`;stmt=env.DB.prepare("SELECT u.*,(SELECT COALESCE(SUM(amount),0) FROM credit_ledger l WHERE l.telegram_id=u.telegram_id) balance FROM users u WHERE CAST(u.telegram_id AS TEXT) LIKE ? OR username LIKE ? OR first_name LIKE ? ORDER BY u.id DESC LIMIT 100").bind(like,like,like);}else stmt=env.DB.prepare("SELECT u.*,(SELECT COALESCE(SUM(amount),0) FROM credit_ledger l WHERE l.telegram_id=u.telegram_id) balance FROM users u ORDER BY u.id DESC LIMIT 100");const r:any=await stmt.all();
+  return `${detailHtml}<div class="card" style="margin-top:14px"><form method="get" action="/admin-web"><input type="hidden" name="tab" value="users"><div class="row"><div><input name="q" value="${webEsc(q)}" placeholder="ID، username یا نام"></div><div><button class="btn">جستجو</button></div></div></form><table><tr><th>ID</th><th>نام</th><th>Username</th><th>موجودی</th><th>عضویت</th><th></th></tr>${(r.results||[]).map((u:any)=>`<tr><td class="ltr">${u.telegram_id}</td><td>${webEsc(u.first_name||'')}</td><td>${u.username?'@'+webEsc(u.username):'—'}</td><td>${Number(u.balance||0).toFixed(2)}</td><td>${u.join_verified?'✅':'—'}</td><td><a class="btn" href="/admin-web?tab=users&id=${u.telegram_id}">باز کردن</a></td></tr>`).join('')}</table></div>`;
+}
+async function adminOrdersHtml(env:Env){const r:any=await env.DB.prepare("SELECT o.*,p.title FROM orders o JOIN products p ON p.id=o.product_id ORDER BY o.id DESC LIMIT 100").all();return `<div class="card"><h3>آخرین سفارش‌ها</h3><table><tr><th>سفارش</th><th>کاربر</th><th>محصول</th><th>فروش</th><th>هزینه</th><th>سود</th><th>وضعیت</th></tr>${(r.results||[]).map((o:any)=>`<tr><td>${webEsc(o.public_id)}</td><td class="ltr">${o.telegram_id}</td><td>${webEsc(o.title)} × ${o.quantity}</td><td>${Number(o.total_price).toFixed(2)}</td><td>${Number(o.cost_total||0).toFixed(2)}</td><td>${(Number(o.total_price)-Number(o.cost_total||0)).toFixed(2)}</td><td>${webEsc(o.status)}</td></tr>`).join('')}</table></div>`;}
+async function adminPaymentsHtml(env:Env){const cfg=await paymentConfig(env);const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase();const auto=await getSetting(env,'ton_usd_rate_auto','0');const upd=await getSetting(env,'ton_usd_rate_updated_at','');return `<div class="card"><h3>نرخ TON و پرداخت</h3><p>نرخ موثر فعلی: <b>$${Number(cfg.tonRate||0).toFixed(4)}</b></p><p class="muted">نرخ خودکار ذخیره‌شده: $${Number(auto||0).toFixed(4)} ${upd?`— ${webEsc(upd)}`:''}</p><form method="post" action="/admin-web"><input type="hidden" name="action" value="ton_rate_save"><div class="row"><div class="field"><label>حالت نرخ</label><select name="mode"><option value="auto" ${mode==='auto'?'selected':''}>خودکار (CoinGecko)</option><option value="manual" ${mode==='manual'?'selected':''}>دستی</option></select></div><div class="field"><label>نرخ دستی TON/USD</label><input type="number" step="0.0001" min="0" name="manual_rate" value="${webEsc(await getSetting(env,'ton_usd_rate',env.TON_USD_RATE||''))}"></div></div><button class="btn primary">ذخیره</button></form><form method="post" action="/admin-web" style="margin-top:10px"><input type="hidden" name="action" value="ton_rate_refresh"><button class="btn good">🔄 دریافت فوری نرخ خودکار</button></form><hr style="border-color:#24314e;margin:18px 0"><p>🟡 BEP20: <span class="ltr">${webEsc(cfg.bep20||'غیرفعال')}</span></p><p>🔴 TRC20: <span class="ltr">${webEsc(cfg.trc20||'غیرفعال')}</span></p><p>💎 TON: <span class="ltr">${webEsc(cfg.ton||'غیرفعال')}</span></p><p>🏦 کارت: ${webEsc(cfg.card||'غیرفعال')} — ${webEsc(cfg.cardHolder||'')}</p></div>`;}
+async function handleWebAdmin(req:Request,env:Env,url:URL):Promise<Response|null>{
+  if(!url.pathname.startsWith('/admin-web'))return null;
+  if(!env.ADMIN_WEB_PASSWORD||!env.ADMIN_SESSION_SECRET)return new Response('ADMIN_WEB_PASSWORD / ADMIN_SESSION_SECRET are not configured.',{status:503});
+  if(req.method==='POST'){
+    const origin=req.headers.get('origin');if(origin&&origin!==url.origin)return new Response('forbidden',{status:403});
+    const fd=await req.formData();const action=String(fd.get('action')||'');
+    if(action==='login'){
+      if(String(fd.get('password')||'')!==env.ADMIN_WEB_PASSWORD)return loginPage('رمز اشتباه است.');
+      const token=await makeAdminSession(env);return new Response(null,{status:303,headers:{location:'/admin-web','set-cookie':`nexora_admin=${encodeURIComponent(token)}; Path=/admin-web; Max-Age=604800; HttpOnly; Secure; SameSite=Strict`}});
+    }
+    if(!(await validAdminSession(req,env)))return loginPage();
+    if(action==='logout')return new Response(null,{status:303,headers:{location:'/admin-web','set-cookie':'nexora_admin=; Path=/admin-web; Max-Age=0; HttpOnly; Secure; SameSite=Strict'}});
+    if(action==='product_save'){
+      const id=Number(fd.get('id')),price=Number(fd.get('price_credits')),cost=Number(fd.get('cost_credits')),sort=Number(fd.get('sort_order')||100),cat=Number(fd.get('category_id')),enabled=Number(fd.get('enabled'))?1:0;
+      if(!id||!Number.isFinite(price)||price<0||!Number.isFinite(cost)||cost<0)return new Response('invalid product data',{status:400});
+      await env.DB.prepare('UPDATE products SET title=?,description=?,price_credits=?,cost_credits=?,warranty_text=?,format_text=?,category_id=?,sort_order=?,enabled=? WHERE id=?').bind(String(fd.get('title')||''),String(fd.get('description')||''),price,cost,String(fd.get('warranty_text')||''),String(fd.get('format_text')||''),cat,sort,enabled,id).run();await logAdmin(env,0,'web_product_save','product',String(id),'web admin');
+      return Response.redirect(`${url.origin}/admin-web?tab=products&edit=${id}`,303);
+    }
+    if(action==='product_create'){
+      const price=Number(fd.get('price_credits')),cost=Number(fd.get('cost_credits')||0),cat=Number(fd.get('category_id')||1);if(!String(fd.get('title')||'').trim()||price<0||cost<0)return new Response('invalid product data',{status:400});
+      const r=await env.DB.prepare("INSERT INTO products(title,description,price_credits,cost_credits,delivery_type,enabled,sort_order,category_id) VALUES(?,?,?,?, 'stock',1,100,?)").bind(String(fd.get('title')),String(fd.get('description')||''),price,cost,cat).run();await logAdmin(env,0,'web_product_create','product',String(r.meta.last_row_id),'web admin');return Response.redirect(`${url.origin}/admin-web?tab=products&edit=${r.meta.last_row_id}`,303);
+    }
+    if(action==='balance_adjust'){
+      const uid=Number(fd.get('telegram_id')),amount=Number(fd.get('amount'));if(!uid||!Number.isFinite(amount)||amount===0)return new Response('invalid adjustment',{status:400});const user:any=await env.DB.prepare('SELECT id FROM users WHERE telegram_id=?').bind(uid).first();if(!user)return new Response('user not found',{status:404});
+      await env.DB.prepare("INSERT INTO credit_ledger(telegram_id,amount,kind,ref_type,ref_id,note) VALUES(?,?,'admin_adjustment','web_admin','0',?)").bind(uid,amount,String(fd.get('note')||'اصلاح موجودی توسط ادمین')).run();await logAdmin(env,0,'web_balance_adjust','user',String(uid),`amount=${amount}`);return Response.redirect(`${url.origin}/admin-web?tab=users&id=${uid}`,303);
+    }
+    if(action==='ton_rate_save'){const mode=String(fd.get('mode')||'auto')==='manual'?'manual':'auto';const manual=Number(fd.get('manual_rate')||0);await setSetting(env,'ton_rate_mode',mode);if(Number.isFinite(manual)&&manual>=0)await setSetting(env,'ton_usd_rate',String(manual));if(mode==='auto')await refreshTonRate(env,true);await logAdmin(env,0,'web_ton_rate','setting','ton_rate_mode',mode);return Response.redirect(`${url.origin}/admin-web?tab=payments`,303);}
+    if(action==='ton_rate_refresh'){await refreshTonRate(env,true);return Response.redirect(`${url.origin}/admin-web?tab=payments`,303);}
+    return new Response('unknown action',{status:400});
+  }
+  if(!(await validAdminSession(req,env)))return loginPage();
+  const tab=url.searchParams.get('tab')||'dashboard';let body='';if(tab==='products')body=await adminProductsHtml(env,url);else if(tab==='users')body=await adminUsersHtml(env,url);else if(tab==='orders')body=await adminOrdersHtml(env);else if(tab==='payments')body=await adminPaymentsHtml(env);else body=await adminDashboardHtml(env);return new Response(webPage('Admin',body,tab),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store'}});
+}
+
+export default {
+  async fetch(req:Request,env:Env):Promise<Response>{
+    const url=new URL(req.url);
+    const webAdmin=await handleWebAdmin(req,env,url); if(webAdmin)return webAdmin;
+    if(url.pathname==='/health')return j({ok:true,time:nowIso(),version:'0.5.0',deployment:'git-first'});
+    if(url.pathname==='/webhook'&&req.method==='POST'){
+      if(env.WEBHOOK_SECRET){const got=req.headers.get('X-Telegram-Bot-Api-Secret-Token'); if(got!==env.WEBHOOK_SECRET)return new Response('forbidden',{status:403});}
+      const u=await req.json() as Update; await handleUpdate(env,u); return j({ok:true});
+    }
+    if(url.pathname==='/setup-webhook'){
+      const secret=url.searchParams.get('secret'); const ok=env.SETUP_SECRET?secret===env.SETUP_SECRET:!!secret&&admins(env).has(Number(secret)); if(!ok)return new Response('forbidden',{status:403});
+      const target=`${env.PUBLIC_BASE_URL.replace(/\/$/,'')}/webhook`; const body:any={url:target,drop_pending_updates:false}; if(env.WEBHOOK_SECRET)body.secret_token=env.WEBHOOK_SECRET; const r=await tg(env,'setWebhook',body); return j(r);
+    }
+    return new Response('Nexora Commerce Bot Worker v0.5.0');
+  },
+  async scheduled(_controller:ScheduledController,env:Env,ctx:ExecutionContext){
+    ctx.waitUntil((async()=>{
+      await env.DB.prepare("UPDATE payment_invoices SET status='expired' WHERE status IN ('pending','awaiting_receipt') AND datetime(expires_at)<=datetime('now')").run();
+      await refreshTonRate(env); await scanPendingCrypto(env); await processBroadcasts(env);
+    })());
+  }
+};
