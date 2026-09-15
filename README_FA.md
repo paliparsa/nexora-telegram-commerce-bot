@@ -1,4 +1,5 @@
-# Nexora Commerce Bot — v0.6 Security Hardening
+# Nexora Commerce Bot — v0.6 Security Hardening 
+
 
 ربات فروش محصولات دیجیتال فارسی برای **Telegram + Cloudflare Workers + D1**. این نسخه روی v0.5 ساخته شده و مهاجرت آن **غیرتخریبی** است؛ دیتابیس، کاربران، سفارش‌ها، موجودی‌ها، تیکت‌ها و تنظیمات فعلی حفظ می‌شوند.
 
