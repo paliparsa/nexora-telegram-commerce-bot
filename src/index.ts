@@ -961,7 +961,14 @@ export default {
       if(req.method!=='POST')return new Response('method not allowed',{status:405,headers:{allow:'GET, POST'}});
       if(!env.SETUP_SECRET||env.SETUP_SECRET.length<16)return new Response('SETUP_SECRET is not configured',{status:503});
       if(!env.WEBHOOK_SECRET||env.WEBHOOK_SECRET.length<16)return new Response('WEBHOOK_SECRET is not configured',{status:503});
-      const origin=req.headers.get('origin');if(origin&&origin!==url.origin)return new Response('forbidden',{status:403});
+      const origin=req.headers.get('origin');
+      if(origin){
+        const allowedOrigins=new Set<string>([url.origin]);
+        try{allowedOrigins.add(new URL(env.PUBLIC_BASE_URL).origin);}catch{}
+        if(!allowedOrigins.has(origin)){
+          return new Response('forbidden: origin mismatch',{status:403,headers:{'cache-control':'no-store'}});
+        }
+      }
       const ct=req.headers.get('content-type')||'';let supplied='';if(ct.includes('application/json')){try{supplied=String((await req.json() as any)?.secret||'');}catch{}}else{try{supplied=String((await req.formData()).get('secret')||'');}catch{}}
       const a=await sha256Hex(supplied),b=await sha256Hex(env.SETUP_SECRET);if(!safeEq(a,b))return setupWebhookPage('Secret صحیح نیست.');
       let base:URL;try{base=new URL(env.PUBLIC_BASE_URL);}catch{return new Response('PUBLIC_BASE_URL is invalid',{status:500});}if(base.protocol!=='https:'||/YOUR-|example/i.test(base.hostname))return new Response('PUBLIC_BASE_URL must be a real HTTPS address',{status:500});
