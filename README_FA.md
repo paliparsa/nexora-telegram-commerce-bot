@@ -175,3 +175,8 @@ Migration جدید فقط جدول‌ها/Indexهای امنیتی را اضاف
 ---
 
 Version: **0.6.0**
+
+
+## اصلاحات v0.6.2
+
+Deploy گیت/کلادفلر حالا با `wrangler deploy --keep-vars` انجام می‌شود تا Variableهای Plaintext که از Dashboard ساخته‌ای پاک نشوند. همچنین خطای اشتباه `origin mismatch` در فرم تنظیم Webhook روی Custom Domain رفع شده است.

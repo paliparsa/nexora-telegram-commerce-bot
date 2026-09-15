@@ -1,12 +1,12 @@
 {
   "name": "nexora-telegram-commerce-bot",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "deploy:cloudflare": "wrangler deploy && wrangler d1 migrations apply DB --remote",
+    "deploy": "wrangler deploy --keep-vars",
+    "deploy:cloudflare": "wrangler deploy --keep-vars && wrangler d1 migrations apply DB --remote",
     "typecheck": "tsc --noEmit",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
     "db:migrate:remote": "wrangler d1 migrations apply DB --remote"

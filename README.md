@@ -175,3 +175,8 @@ Migration جدید فقط جدول‌ها/Indexهای امنیتی را اضاف
 ---
 
 Version: **0.6.0**
+
+
+## v0.6.2 deployment fix
+
+Git/Cloudflare deploys now use `wrangler deploy --keep-vars`, so dashboard-configured plaintext Variables are preserved. Webhook setup also accepts valid custom-domain form submissions without the previous false `origin mismatch`.
