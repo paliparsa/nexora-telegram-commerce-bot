@@ -1,4 +1,37 @@
-# Nexora Commerce Bot — v0.6 Security Hardening
+# Nexora Commerce Bot — v0.7 Operations Suite
+
+نسخه v0.7 روی v0.6.2 ساخته شده و برای **آپدیت مستقیم Repo فعلی GitHub → Cloudflare Workers** طراحی شده است. دیتابیس فعلی حذف نمی‌شود و migration جدید `0006_operations_suite.sql` فقط قابلیت‌های جدید را اضافه می‌کند. فایل `wrangler.jsonc` عمداً در بسته آپدیت نیست تا `database_id` واقعی D1 شما دست نخورد.
+
+## امکانات جدید v0.7
+
+- Referral پیشرفته: Trigger قابل انتخاب بین عضویت معتبر و اولین خرید، Tierهای Bronze/Silver/Gold و ضریب پاداش.
+- مانیتورینگ پرداخت: تشخیص late payment، underpayment، overpayment، confirmation count و بررسی دستی توسط ادمین.
+- Rate Engine مرکزی برای `TON/USD`، `USD/TRY` و `USD/IRR` با Auto/Manual.
+- Risk/Ban: Ban/Unban، Risk level، یادداشت داخلی، سقف خرید، خاموش‌کردن Referral و Blacklist برای username / wallet / TXID.
+- اعلان ادمین برای سفارش جدید، پرداخت کریپتو، موجودی کم و ایراد پرداخت.
+- Backup/Export امن از پنل وب برای Users، Orders، Ledger، Payments، Settings و Full Backup.
+- Maintenance Mode.
+- Feature Flags برای Shop، Crypto، Card-to-card، Referral، Support و Broadcast.
+- تشخیص خودکار ادمین با `ADMIN_IDS` و نمایش دکمه **ورود به حالت مدیریت** در منوی خود ادمین.
+- رفع `403 Forbidden` روی **Refresh Rate** پنل وب: تزریق CSRF اصلاح شده و بررسی Origin شکننده حذف شده؛ محافظت همچنان با Session + SameSite + CSRF معتبر انجام می‌شود.
+- Deploy امن‌تر: migration **قبل از** deploy اجرا می‌شود تا کد جدید قبل از آماده شدن Schema بالا نیاید. `--keep-vars` نیز حفظ شده است.
+
+## Upgrade from v0.6.2 (GitHub → Cloudflare)
+
+1. ZIP v0.7 را روی Root Repo فعلی Upload/Replace کن.
+2. `wrangler.jsonc` فعلی را نگه دار؛ این ZIP آن را ندارد.
+3. Commit به `main` بزن.
+4. Cloudflare Build دستور `npm run deploy:cloudflare` را اجرا می‌کند. در v0.7 این دستور ابتدا migration را روی D1 اعمال می‌کند و بعد Worker را با `--keep-vars` Deploy می‌کند.
+5. در Build log باید `0006_operations_suite.sql` موفق باشد و بعد `wrangler deploy --keep-vars` اجرا شود.
+6. بات را با `/start` تست کن. اگر Telegram ID شما داخل `ADMIN_IDS` باشد، پایین منو دکمه `🛠 ورود به حالت مدیریت` ظاهر می‌شود.
+7. پنل وب را باز کن و در تب «پرداخت و نرخ» دکمه Refresh را تست کن؛ دیگر نباید `forbidden` بگیری.
+8. تب‌های جدید «عملیات» و «Backup» را هم تست کن.
+
+### Secret یا Variable جدید لازم است؟
+
+خیر. v0.7 برای قابلیت‌های جدید Variable اجباری جدیدی ندارد و تنظیمات جدید داخل `bot_settings` در D1 ذخیره می‌شوند. Secretهای v0.6 مثل `STOCK_ENCRYPTION_KEY` را تغییر نده.
+
+---
 
 ربات فروش محصولات دیجیتال فارسی برای **Telegram + Cloudflare Workers + D1**. این نسخه روی v0.5 ساخته شده و مهاجرت آن **غیرتخریبی** است؛ دیتابیس، کاربران، سفارش‌ها، موجودی‌ها، تیکت‌ها و تنظیمات فعلی حفظ می‌شوند.
 
@@ -177,6 +210,6 @@ Migration جدید فقط جدول‌ها/Indexهای امنیتی را اضاف
 Version: **0.6.0**
 
 
-## v0.6.2 deployment fix
+## اصلاحات v0.6.2
 
-Git/Cloudflare deploys now use `wrangler deploy --keep-vars`, so dashboard-configured plaintext Variables are preserved. Webhook setup also accepts valid custom-domain form submissions without the previous false `origin mismatch`.
+Deploy گیت/کلادفلر حالا با `wrangler deploy --keep-vars` انجام می‌شود تا Variableهای Plaintext که از Dashboard ساخته‌ای پاک نشوند. همچنین خطای اشتباه `origin mismatch` در فرم تنظیم Webhook روی Custom Domain رفع شده است.
