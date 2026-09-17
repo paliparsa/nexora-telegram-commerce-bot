@@ -217,3 +217,7 @@ Version: **0.6.0**
 ## اصلاحات v0.6.2
 
 Deploy گیت/کلادفلر حالا با `wrangler deploy --keep-vars` انجام می‌شود تا Variableهای Plaintext که از Dashboard ساخته‌ای پاک نشوند. همچنین خطای اشتباه `origin mismatch` در فرم تنظیم Webhook روی Custom Domain رفع شده است.
+
+## v0.7.3 — Payment diagnostics
+
+پنل پرداخت اکنون تست مستقل و تست یکجای BEP20، TRC20، TON، کارت‌به‌کارت و Rate Engine دارد. BEP20 ابتدا Etherscan API V2 را استفاده می‌کند و اگر provider در دسترس نباشد به BSC RPC fallback می‌رود. متغیر اختیاری `BSC_RPC_URL` برای تغییر RPC قابل استفاده است.

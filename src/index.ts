@@ -2,6 +2,7 @@ export interface Env {
   DB: D1Database;
   BOT_TOKEN: string;
   ETHERSCAN_API_KEY?: string;
+  BSC_RPC_URL?: string;
   TRONGRID_API_KEY?: string;
   TONAPI_API_KEY?: string;
   BOT_USERNAME: string;
@@ -44,6 +45,9 @@ const publicId=(p:string)=>`${p}${randomHex(10).toUpperCase()}`;
 function secureRandomInt(maxExclusive:number){const a=new Uint32Array(1);crypto.getRandomValues(a);return a[0]%maxExclusive;}
 const BSC_MAINNET_CHAIN_ID='56';
 const BSC_USDT_CONTRACT='0x55d398326f99059fF775485246999027B3197955';
+const TRON_USDT_CONTRACT='TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
+const DEFAULT_BSC_RPC='https://bsc-dataseed.binance.org/';
+const ERC20_TRANSFER_TOPIC='0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const normEvm=(v:string='')=>v.trim().toLowerCase();
 const admins=(env:Env)=>new Set((env.ADMIN_IDS||'').split(',').map(x=>Number(x.trim())).filter(Boolean));
 const isAdmin=(env:Env,id:number)=>admins(env).has(id);
@@ -223,7 +227,7 @@ async function refreshTonRate(env:Env,force=false){
     return cached||null;
   }
   try{
-    const r=await fetch('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',{headers:{'accept':'application/json','user-agent':'Nexora-Commerce-Bot/0.7.1'}});
+    const r=await fetch('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',{headers:{'accept':'application/json','user-agent':'Nexora-Commerce-Bot/0.7.3'}});
     if(!r.ok)throw new Error(`rate_http_${r.status}`);
     const data:any=await r.json(); const rate=Number(data?.['the-open-network']?.usd||0);
     if(!Number.isFinite(rate)||rate<=0)throw new Error('invalid_rate');
@@ -252,7 +256,9 @@ async function bep20Status(env:Env){
   const tokenOk=normEvm(token)===normEvm(BSC_USDT_CONTRACT);
   const chainOk=chain===BSC_MAINNET_CHAIN_ID;
   const apiOk=!!env.ETHERSCAN_API_KEY;
-  return {wallet,token,chain,testMode,enabled,walletOk,tokenOk,chainOk,apiOk,ready:enabled&&walletOk&&tokenOk&&chainOk&&apiOk};
+  const rpcUrl=String(env.BSC_RPC_URL||DEFAULT_BSC_RPC).trim();
+  const rpcOk=/^https:\/\//i.test(rpcUrl);
+  return {wallet,token,chain,testMode,enabled,walletOk,tokenOk,chainOk,apiOk,rpcUrl,rpcOk,ready:enabled&&walletOk&&tokenOk&&chainOk&&rpcOk};
 }
 async function paymentConfig(env:Env){
   return {
@@ -323,14 +329,57 @@ async function showCardInvoice(env:Env,chat:number,mid:number,uid:number,usd:num
 }
 
 type ChainTransfer={hash:string;from?:string;to:string;amount:number;ts:number;ok:boolean;confirmations?:number;contract?:string;blockNumber?:number};
+type ProviderCheck={ok:boolean;http?:number;message:string;detail?:string};
+async function etherscanBscCheck(env:Env,wallet?:string):Promise<ProviderCheck>{
+  if(!env.ETHERSCAN_API_KEY)return {ok:false,message:'API key وارد نشده'};
+  try{
+    const u=new URL('https://api.etherscan.io/v2/api');
+    u.searchParams.set('chainid',BSC_MAINNET_CHAIN_ID);u.searchParams.set('module','proxy');u.searchParams.set('action','eth_blockNumber');u.searchParams.set('apikey',String(env.ETHERSCAN_API_KEY));
+    const r=await fetch(u.toString(),{headers:{accept:'application/json'}});const raw=await r.text();let d:any=null;try{d=JSON.parse(raw)}catch{}
+    const result=String(d?.result||'');const msg=String(d?.message||'');
+    const ok=r.ok&&/^0x[0-9a-f]+$/i.test(result);
+    return {ok,http:r.status,message:ok?'Etherscan V2 / BSC پاسخ معتبر داد':(msg||result||raw||`HTTP ${r.status}`).slice(0,220),detail:wallet?`wallet=${wallet.slice(0,8)}…`:undefined};
+  }catch(e:any){return {ok:false,message:String(e?.message||e).slice(0,220)};}
+}
+async function bscRpcCall(env:Env,method:string,params:any[]):Promise<any>{
+  const url=String(env.BSC_RPC_URL||DEFAULT_BSC_RPC).trim();
+  const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json','accept':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})});
+  const raw=await r.text();let d:any=null;try{d=JSON.parse(raw)}catch{}
+  if(!r.ok)throw new Error(`HTTP ${r.status}: ${raw.slice(0,160)}`);
+  if(d?.error)throw new Error(String(d.error?.message||JSON.stringify(d.error)).slice(0,180));
+  return d?.result;
+}
+async function bscRpcCheck(env:Env):Promise<ProviderCheck>{
+  try{const x=await bscRpcCall(env,'eth_blockNumber',[]);const ok=/^0x[0-9a-f]+$/i.test(String(x||''));return {ok,message:ok?`BSC RPC آنلاین — block ${parseInt(String(x),16)}`:`پاسخ نامعتبر: ${String(x).slice(0,160)}`};}
+  catch(e:any){return {ok:false,message:String(e?.message||e).slice(0,220)};}
+}
+async function fetchBep20Etherscan(env:Env,wallet:string):Promise<{ok:boolean;items:ChainTransfer[];message:string}>{
+  if(!env.ETHERSCAN_API_KEY)return {ok:false,items:[],message:'missing api key'};
+  const u=new URL('https://api.etherscan.io/v2/api');u.searchParams.set('chainid',BSC_MAINNET_CHAIN_ID);u.searchParams.set('module','account');u.searchParams.set('action','tokentx');
+  u.searchParams.set('contractaddress',BSC_USDT_CONTRACT);u.searchParams.set('address',wallet);u.searchParams.set('page','1');u.searchParams.set('offset','150');u.searchParams.set('sort','desc');u.searchParams.set('apikey',String(env.ETHERSCAN_API_KEY));
+  try{
+    const r=await fetch(u.toString(),{headers:{accept:'application/json'}});const raw=await r.text();let d:any=null;try{d=JSON.parse(raw)}catch{}
+    const arr=Array.isArray(d?.result)?d.result:[];const text=String(d?.result||d?.message||raw||'');
+    const noTx=/no transactions found/i.test(text)||(/NOTOK/i.test(String(d?.message||''))&&Array.isArray(d?.result)&&d.result.length===0);
+    const ok=r.ok&&(String(d?.status)==='1'||Array.isArray(d?.result)||noTx);
+    if(!ok)return {ok:false,items:[],message:(String(d?.result||d?.message||raw||`HTTP ${r.status}`)).slice(0,220)};
+    const items=arr.filter((x:any)=>normEvm(String(x.contractAddress||''))===normEvm(BSC_USDT_CONTRACT)&&normEvm(String(x.to||''))===normEvm(wallet)&&String(x.isError||'0')!=='1'&&Number(x.blockNumber||0)>0).map((x:any)=>({hash:String(x.hash||''),from:String(x.from||''),to:String(x.to||''),amount:Number(x.value)/10**Number(x.tokenDecimal||18),ts:Number(x.timeStamp||0)*1000,ok:true,confirmations:Number(x.confirmations||0),contract:String(x.contractAddress||''),blockNumber:Number(x.blockNumber||0)}));
+    return {ok:true,items,message:items.length?`${items.length} transfer found`:'connected; no matching transfers'};
+  }catch(e:any){return {ok:false,items:[],message:String(e?.message||e).slice(0,220)};}
+}
+async function fetchBep20Rpc(env:Env,wallet:string):Promise<ChainTransfer[]>{
+  const latestHex=await bscRpcCall(env,'eth_blockNumber',[]);const latest=parseInt(String(latestHex),16);if(!Number.isFinite(latest))throw new Error('invalid latest block');
+  const from=Math.max(0,latest-4500);const topicTo='0x'+wallet.toLowerCase().replace(/^0x/,'').padStart(64,'0');
+  const logs:any[]=await bscRpcCall(env,'eth_getLogs',[{fromBlock:'0x'+from.toString(16),toBlock:'latest',address:BSC_USDT_CONTRACT,topics:[ERC20_TRANSFER_TOPIC,null,topicTo]}])||[];
+  const selected=logs.slice(-150).reverse();const blocks=new Map<number,number>();
+  for(const l of selected){const bn=parseInt(String(l.blockNumber||'0x0'),16);if(bn&&!blocks.has(bn)){try{const b=await bscRpcCall(env,'eth_getBlockByNumber',['0x'+bn.toString(16),false]);blocks.set(bn,parseInt(String(b?.timestamp||'0x0'),16)*1000);}catch{blocks.set(bn,0);}}}
+  return selected.map((l:any)=>{const bn=parseInt(String(l.blockNumber||'0x0'),16);let amount=0;try{amount=Number(BigInt(String(l.data||'0x0')))/1e18}catch{}return {hash:String(l.transactionHash||''),from:'',to:wallet,amount,ts:blocks.get(bn)||0,ok:true,confirmations:Math.max(0,latest-bn+1),contract:BSC_USDT_CONTRACT,blockNumber:bn};});
+}
 async function fetchBep20Transfers(env:Env,wallet:string):Promise<ChainTransfer[]>{
   const st=await bep20Status(env);if(!st.ready||normEvm(wallet)!==normEvm(st.wallet))return [];
-  const u=new URL('https://api.etherscan.io/v2/api'); u.searchParams.set('chainid',BSC_MAINNET_CHAIN_ID); u.searchParams.set('module','account'); u.searchParams.set('action','tokentx');
-  u.searchParams.set('contractaddress',BSC_USDT_CONTRACT); u.searchParams.set('address',wallet); u.searchParams.set('page','1'); u.searchParams.set('offset','150'); u.searchParams.set('sort','desc'); u.searchParams.set('apikey',String(env.ETHERSCAN_API_KEY));
-  try{
-    const r=await fetch(u.toString(),{headers:{accept:'application/json'}});if(!r.ok)return [];const d:any=await r.json(); const arr=Array.isArray(d.result)?d.result:[];
-    return arr.filter((x:any)=>normEvm(String(x.contractAddress||''))===normEvm(BSC_USDT_CONTRACT)&&normEvm(String(x.to||''))===normEvm(wallet)&&String(x.isError||'0')!=='1'&&Number(x.blockNumber||0)>0).map((x:any)=>({hash:String(x.hash||''),from:String(x.from||''),to:String(x.to||''),amount:Number(x.value)/10**Number(x.tokenDecimal||18),ts:Number(x.timeStamp||0)*1000,ok:true,confirmations:Number(x.confirmations||0),contract:String(x.contractAddress||''),blockNumber:Number(x.blockNumber||0)}));
-  }catch(e){console.log('BEP20 scanner failed',String(e));return []}
+  const es=await fetchBep20Etherscan(env,wallet);if(es.ok)return es.items;
+  console.log('Etherscan BSC scanner unavailable, using RPC fallback:',es.message);
+  try{return await fetchBep20Rpc(env,wallet);}catch(e){console.log('BSC RPC fallback failed',String(e));return []}
 }
 async function fetchTrc20Transfers(env:Env,wallet:string):Promise<ChainTransfer[]>{
   if(!wallet||!env.USDT_TRC20_TOKEN)return [];
@@ -347,6 +396,49 @@ async function fetchTonTransfers(env:Env,wallet:string):Promise<ChainTransfer[]>
     for(const ev of (d.events||[])){for(const a of (ev.actions||[])){const tt=a.TonTransfer||a.ton_transfer;if(!tt)continue;const dest=String(tt.recipient?.address||tt.recipient?.account_address||'');if(dest!==wallet&&dest!==normalized)continue;const amount=Number(tt.amount||0)/1e9;out.push({hash:String(ev.event_id||''),from:String(tt.sender?.address||tt.sender?.account_address||''),to:wallet,amount,ts:Number(ev.timestamp||0)*1000,ok:String(ev.status||'ok').toLowerCase()!=='failed',confirmations:1});}}return out;
   }catch{return []}
 }
+
+type MethodDiagnostic={name:string;ok:boolean;lines:string[]};
+function okMark(v:boolean){return v?'✅':'❌';}
+function maskSecret(v?:string){if(!v)return 'ندارد';return v.length<=8?'••••':`${v.slice(0,4)}…${v.slice(-4)}`;}
+async function diagnoseBep20(env:Env):Promise<MethodDiagnostic>{
+  const b=await bep20Status(env);const es=await etherscanBscCheck(env,b.wallet);const rpc=await bscRpcCheck(env);const providerOk=es.ok||rpc.ok;
+  return {name:'BEP20 / BSC',ok:b.walletOk&&b.tokenOk&&b.chainOk&&providerOk,lines:[
+    `${okMark(b.walletOk)} Wallet: ${b.walletOk?'معتبر':'نامعتبر/تنظیم نشده'}`,
+    `${okMark(b.tokenOk)} USDT contract whitelist: ${b.tokenOk?'صحیح':'اشتباه'}`,
+    `${okMark(b.chainOk)} Chain ID: ${b.chain||'—'} ${b.chainOk?'':'(باید 56 باشد)'}`,
+    `${es.ok?'✅':'⚠️'} Etherscan V2: ${es.message}`,
+    `${rpc.ok?'✅':'❌'} BSC RPC fallback: ${rpc.message}`,
+    `🔑 Etherscan key: ${maskSecret(env.ETHERSCAN_API_KEY)}`,
+    `🧪 Mode: ${b.testMode?'TEST':'LIVE'}`
+  ]};
+}
+async function diagnoseTrc20(env:Env):Promise<MethodDiagnostic>{
+  const wallet=await getSetting(env,'wallet_trc20',env.USDT_TRC20_WALLET||'');const token=String(env.USDT_TRC20_TOKEN||'').trim();
+  const walletOk=/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(wallet);const tokenOk=token===TRON_USDT_CONTRACT;let apiOk=false,msg='بررسی نشد';
+  if(walletOk&&tokenOk){try{const u=new URL(`https://api.trongrid.io/v1/accounts/${encodeURIComponent(wallet)}/transactions/trc20`);u.searchParams.set('only_confirmed','true');u.searchParams.set('only_to','true');u.searchParams.set('limit','1');u.searchParams.set('contract_address',token);const h:any={accept:'application/json'};if(env.TRONGRID_API_KEY)h['TRON-PRO-API-KEY']=env.TRONGRID_API_KEY;const r=await fetch(u.toString(),{headers:h});const raw=await r.text();let d:any=null;try{d=JSON.parse(raw)}catch{}apiOk=r.ok&&d?.success!==false&&!d?.Error;msg=apiOk?`TronGrid پاسخ معتبر داد${Array.isArray(d?.data)?` — ${d.data.length} رکورد نمونه`:''}`:String(d?.Error||d?.error||d?.message||raw||`HTTP ${r.status}`).slice(0,220);}catch(e:any){msg=String(e?.message||e).slice(0,220);}}
+  return {name:'TRC20 / TRON',ok:walletOk&&tokenOk&&apiOk,lines:[`${okMark(walletOk)} Wallet: ${walletOk?'معتبر':'نامعتبر/تنظیم نشده'}`,`${okMark(tokenOk)} USDT contract: ${tokenOk?'رسمی/صحیح':'اشتباه یا تنظیم نشده'}`,`${apiOk?'✅':'❌'} TronGrid: ${msg}`,`${env.TRONGRID_API_KEY?'✅':'⚠️'} API key: ${env.TRONGRID_API_KEY?maskSecret(env.TRONGRID_API_KEY):'تنظیم نشده — برای production توصیه می‌شود'}`]};
+}
+async function diagnoseTon(env:Env):Promise<MethodDiagnostic>{
+  const wallet=await getSetting(env,'wallet_ton',env.TON_WALLET||'');const walletOk=/^(?:EQ|UQ)[A-Za-z0-9_-]{46}$/.test(wallet)||/^0:[0-9a-fA-F]{64}$/.test(wallet);const headers:any={accept:'application/json'};if(env.TONAPI_API_KEY)headers.Authorization=`Bearer ${env.TONAPI_API_KEY}`;let apiOk=false,accountOk=false,msg='بررسی نشد';
+  try{const r=await fetch('https://tonapi.io/v2/blockchain/masterchain-head',{headers});const raw=await r.text();apiOk=r.ok;msg=apiOk?`TonAPI آنلاین (HTTP ${r.status})`:String(raw||`HTTP ${r.status}`).slice(0,220);}catch(e:any){msg=String(e?.message||e).slice(0,220);}
+  if(walletOk){try{const r=await fetch(`https://tonapi.io/v2/accounts/${encodeURIComponent(wallet)}`,{headers});accountOk=r.ok;if(!accountOk){const raw=await r.text();msg+=` | account: ${raw.slice(0,120)}`;}}catch{accountOk=false;}}
+  const rate=await effectiveTonRate(env);const rateOk=Number(rate)>0;
+  return {name:'TON',ok:walletOk&&apiOk&&accountOk&&rateOk,lines:[`${okMark(walletOk)} Wallet: ${walletOk?'فرمت معتبر':'نامعتبر/تنظیم نشده'}`,`${apiOk?'✅':'❌'} TonAPI: ${msg}`,`${accountOk?'✅':'❌'} Wallet lookup: ${accountOk?'موفق':'ناموفق'}`,`${env.TONAPI_API_KEY?'✅':'⚠️'} API key: ${env.TONAPI_API_KEY?maskSecret(env.TONAPI_API_KEY):'ندارد — حالت بدون کلید rate-limit پایین‌تری دارد'}`,`${okMark(rateOk)} TON/USD rate: ${rateOk?Number(rate).toFixed(4):'تنظیم نشده'}`]};
+}
+async function diagnoseCard(env:Env):Promise<MethodDiagnostic>{
+  const cfg=await paymentConfig(env);const digits=String(cfg.card||'').replace(/\D/g,'');const numberOk=digits.length>=16&&digits.length<=19;const holderOk=String(cfg.cardHolder||'').trim().length>=2;const feature=await featureEnabled(env,'feature_card',true);
+  return {name:'کارت به کارت',ok:feature&&numberOk&&holderOk,lines:[`${okMark(feature)} Feature: ${feature?'فعال':'غیرفعال'}`,`${okMark(numberOk)} شماره کارت: ${numberOk?`•••• ${digits.slice(-4)}`:'نامعتبر/تنظیم نشده'}`,`${okMark(holderOk)} صاحب کارت: ${holderOk?cfg.cardHolder:'تنظیم نشده'}`,'ℹ️ این روش تأیید دستی است و API بانکی ندارد.']};
+}
+async function diagnoseRates(env:Env):Promise<MethodDiagnostic>{
+  let cg=false,fr=false,cgMsg='',frMsg='';
+  try{const r=await fetch('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',{headers:{accept:'application/json','user-agent':'Nexora-Commerce-Bot/0.7.3'}});const d:any=await r.json().catch(()=>null);cg=r.ok&&Number(d?.['the-open-network']?.usd)>0;cgMsg=cg?`TON/USD=${Number(d['the-open-network'].usd)}`:`HTTP ${r.status}`;}catch(e:any){cgMsg=String(e?.message||e).slice(0,120);}
+  try{const r=await fetch('https://api.frankfurter.app/latest?from=USD&to=TRY',{headers:{accept:'application/json'}});const d:any=await r.json().catch(()=>null);fr=r.ok&&Number(d?.rates?.TRY)>0;frMsg=fr?`USD/TRY=${Number(d.rates.TRY)}`:`HTTP ${r.status}`;}catch(e:any){frMsg=String(e?.message||e).slice(0,120);}
+  const irr=Number(await getSetting(env,'rate_usd_irr_manual','0'))||0;return {name:'Rate Engine',ok:cg&&fr,lines:[`${cg?'✅':'❌'} CoinGecko: ${cgMsg}`,`${fr?'✅':'❌'} Frankfurter: ${frMsg}`,`${irr>0?'✅':'⚠️'} USD/IRR manual: ${irr>0?irr:'تنظیم نشده'}`]};
+}
+async function paymentDiagnostics(env:Env,which='all'){const out:MethodDiagnostic[]=[];if(which==='all'||which==='bep20')out.push(await diagnoseBep20(env));if(which==='all'||which==='trc20')out.push(await diagnoseTrc20(env));if(which==='all'||which==='ton')out.push(await diagnoseTon(env));if(which==='all'||which==='card')out.push(await diagnoseCard(env));if(which==='all'||which==='rates')out.push(await diagnoseRates(env));return out;}
+function diagnosticsTelegramText(items:MethodDiagnostic[]){let t='🧪 <b>تست روش‌های پرداخت</b>\n';for(const x of items){t+=`\n${x.ok?'✅':'❌'} <b>${esc(x.name)}</b>\n${x.lines.map(v=>esc(v)).join('\n')}\n`;}return t.slice(0,3900);}
+function diagnosticsHtml(items:MethodDiagnostic[]){return `<div class="card" style="margin-top:14px"><h3>🧪 نتیجه تست</h3>${items.map(x=>`<div style="padding:10px 0;border-bottom:1px solid #24314e"><b>${x.ok?'✅':'❌'} ${webEsc(x.name)}</b><div class="muted" style="white-space:pre-wrap;margin-top:7px">${x.lines.map(webEsc).join('<br>')}</div></div>`).join('')}</div>`;}
+
 function sameDest(network:string,a:string,b:string){if(network==='TON')return true;return network==='BEP20'?a.toLowerCase()===b.toLowerCase():a===b;}
 async function settleCrypto(env:Env,invoice:any,tx:ChainTransfer){
   const txHash=String(tx.hash||'').toLowerCase(); if(!txHash||!tx.ok)return false;
@@ -675,7 +767,7 @@ async function adminPayments(env:Env,chat:number,mid:number){
   const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase(); const updated=await getSetting(env,'ton_usd_rate_updated_at','');const b=await bep20Status(env);
   const bepState=!b.enabled?'⚪ غیرفعال':!b.ready?'🔴 تنظیم ناقص':b.testMode?'🧪 تست':'🟢 واقعی';
   const t=`💳 <b>تنظیمات پرداخت</b>\n\n🟡 BEP20: <code>${esc(short(c.bep20))}</code> — <b>${bepState}</b>\n🔐 Contract: <code>${BSC_USDT_CONTRACT}</code>\n⛓ Chain ID: <b>56</b> | Confirmations: <b>${await getSetting(env,'confirmations_bep20','5')}</b>\n🔴 TRC20: <code>${esc(short(c.trc20))}</code>\n💎 TON: <code>${esc(short(c.ton))}</code>\n📈 نرخ TON/USD: <b>${c.tonRate||'تنظیم نشده'}</b>\n🤖 حالت نرخ TON: <b>${mode==='auto'?'خودکار':'دستی'}</b>${updated?`\n🕒 آخرین نرخ خودکار: ${esc(updated)}`:''}\n🏦 کارت: <code>${esc(c.card||'تنظیم نشده')}</code>\n👤 صاحب کارت: <b>${esc(c.cardHolder||'—')}</b>`;
-  await edit(env,chat,mid,t,[[{text:'🟡 آدرس BEP20',callback_data:'admin:payset:wallet_bep20'},{text:'🔴 آدرس TRC20',callback_data:'admin:payset:wallet_trc20'}],[{text:b.testMode?'🧪 BEP20: تست':'🟢 BEP20: واقعی',callback_data:'admin:bep20:mode'},{text:b.enabled?'⏸ خاموش BEP20':'▶️ روشن BEP20',callback_data:'admin:bep20:toggle'}],[{text:'🔎 بررسی تنظیم BEP20',callback_data:'admin:bep20:check'}],[{text:'💎 آدرس TON',callback_data:'admin:payset:wallet_ton'},{text:'📈 نرخ دستی TON',callback_data:'admin:payset:ton_usd_rate'}],[{text:mode==='auto'?'✅ نرخ خودکار':'🤖 فعال‌کردن نرخ خودکار',callback_data:'admin:tonrate:auto'},{text:'🔄 بروزرسانی نرخ',callback_data:'admin:tonrate:refresh'}],[{text:'✍️ حالت دستی',callback_data:'admin:tonrate:manual'}],[{text:'🏦 شماره کارت',callback_data:'admin:payset:card_number'},{text:'👤 صاحب کارت',callback_data:'admin:payset:card_holder'}],[{text:'⬅️ پنل مدیریت',callback_data:'admin:home'}]]);
+  await edit(env,chat,mid,t,[[{text:'🟡 آدرس BEP20',callback_data:'admin:payset:wallet_bep20'},{text:'🔴 آدرس TRC20',callback_data:'admin:payset:wallet_trc20'}],[{text:b.testMode?'🧪 BEP20: تست':'🟢 BEP20: واقعی',callback_data:'admin:bep20:mode'},{text:b.enabled?'⏸ خاموش BEP20':'▶️ روشن BEP20',callback_data:'admin:bep20:toggle'}],[{text:'🧪 تست همه روش‌ها',callback_data:'admin:paytest:all'}],[{text:'🟡 تست BEP20',callback_data:'admin:paytest:bep20'},{text:'🔴 تست TRC20',callback_data:'admin:paytest:trc20'}],[{text:'💎 تست TON',callback_data:'admin:paytest:ton'},{text:'🏦 تست کارت',callback_data:'admin:paytest:card'}],[{text:'📈 تست Rate Engine',callback_data:'admin:paytest:rates'}],[{text:'💎 آدرس TON',callback_data:'admin:payset:wallet_ton'},{text:'📈 نرخ دستی TON',callback_data:'admin:payset:ton_usd_rate'}],[{text:mode==='auto'?'✅ نرخ خودکار':'🤖 فعال‌کردن نرخ خودکار',callback_data:'admin:tonrate:auto'},{text:'🔄 بروزرسانی نرخ',callback_data:'admin:tonrate:refresh'}],[{text:'✍️ حالت دستی',callback_data:'admin:tonrate:manual'}],[{text:'🏦 شماره کارت',callback_data:'admin:payset:card_number'},{text:'👤 صاحب کارت',callback_data:'admin:payset:card_holder'}],[{text:'⬅️ پنل مدیریت',callback_data:'admin:home'}]]);
 }
 async function adminOrders(env:Env,chat:number,mid:number){
   const q:any=await env.DB.prepare("SELECT o.*,p.title FROM orders o JOIN products p ON p.id=o.product_id ORDER BY o.id DESC LIMIT 20").all();
@@ -915,36 +1007,12 @@ async function handleCallback(env:Env,c:CallbackQuery){
   if(d==='admin:scan'){const n=await scanPendingCrypto(env); await logAdmin(env,uid,'crypto_scan',undefined,undefined,`settled=${n}`);return answerCb(env,c.id,`${n} پرداخت جدید تأیید شد.`,true);}
   if(d==='admin:bep20:mode'){const b=await bep20Status(env);await setSetting(env,'bep20_test_mode',b.testMode?'0':'1');await logAdmin(env,uid,'bep20_mode','setting','bep20_test_mode',b.testMode?'live':'test');return adminPayments(env,chat,mid);}
   if(d==='admin:bep20:toggle'){const b=await bep20Status(env);await setSetting(env,'feature_bep20',b.enabled?'0':'1');await logAdmin(env,uid,'bep20_toggle','setting','feature_bep20',b.enabled?'off':'on');return adminPayments(env,chat,mid);}
-  if(d==='admin:bep20:check'){
-    const b=await bep20Status(env);
-    let apiReachable=false,apiMessage='بررسی نشد';
-    if(b.walletOk&&b.tokenOk&&b.chainOk&&b.apiOk){
-      try{
-        const u=new URL('https://api.etherscan.io/v2/api');
-        u.searchParams.set('chainid',BSC_MAINNET_CHAIN_ID);
-        u.searchParams.set('module','account');
-        u.searchParams.set('action','tokentx');
-        u.searchParams.set('contractaddress',BSC_USDT_CONTRACT);
-        u.searchParams.set('address',b.wallet);
-        u.searchParams.set('page','1');u.searchParams.set('offset','1');u.searchParams.set('sort','desc');
-        u.searchParams.set('apikey',String(env.ETHERSCAN_API_KEY));
-        const r=await fetch(u.toString(),{headers:{accept:'application/json'}});
-        const body:any=await r.json().catch(()=>null);
-        apiReachable=r.ok&&body&&String(body.status??'')!=='0';
-        if(r.ok&&body&&Array.isArray(body.result))apiReachable=true;
-        apiMessage=apiReachable?'✅ API پاسخ معتبر داد':`❌ ${String(body?.message||body?.result||('HTTP '+r.status)).slice(0,140)}`;
-      }catch(e:any){apiMessage=`❌ ${String(e?.message||e).slice(0,140)}`;}
-    }
-    const ready=b.ready&&apiReachable;
-    const msg=`🔎 <b>تست تنظیمات BEP20</b>\n\n`+
-      `Wallet: ${b.walletOk?'✅ OK':'❌ BAD'}\n`+
-      `Contract whitelist: ${b.tokenOk?'✅ OK':'❌ BAD'}\n`+
-      `Chain ID 56: ${b.chainOk?'✅ OK':'❌ BAD'}\n`+
-      `API key: ${b.apiOk?'✅ موجود':'❌ وارد نشده'}\n`+
-      `API connection: ${esc(apiMessage)}\n`+
-      `Mode: <b>${b.testMode?'TEST':'LIVE'}</b>\n\n`+
-      `${ready?'✅ <b>BEP20 آماده تست تراکنش است.</b>':'❌ <b>BEP20 هنوز آماده نیست.</b>'}`;
-    return edit(env,chat,mid,msg,[[{text:'🔄 تست دوباره',callback_data:'admin:bep20:check'}],[{text:'⬅️ تنظیمات پرداخت',callback_data:'admin:payments'}]]);
+  if(d==='admin:bep20:check'||d.startsWith('admin:paytest:')){
+    const which=d==='admin:bep20:check'?'bep20':d.split(':')[2];
+    await answerCb(env,c.id,'در حال تست…');
+    const items=await paymentDiagnostics(env,which);
+    const rows:Btn[][]=[[{text:'🔄 تست دوباره',callback_data:`admin:paytest:${which}`}],[{text:'⬅️ تنظیمات پرداخت',callback_data:'admin:payments'}]];
+    return edit(env,chat,mid,diagnosticsTelegramText(items),rows);
   }
   if(d==='admin:products')return adminProducts(env,chat,mid);
   if(d==='admin:categories')return adminCategories(env,chat,mid);
@@ -1065,11 +1133,11 @@ async function adminUsersHtml(env:Env,url:URL){
   return `${detailHtml}<div class="card" style="margin-top:14px"><form method="get" action="/admin-web"><input type="hidden" name="tab" value="users"><div class="row"><div><input name="q" value="${webEsc(q)}" placeholder="ID، username یا نام"></div><div><button class="btn">جستجو</button></div></div></form><table><tr><th>ID</th><th>نام</th><th>Username</th><th>موجودی</th><th>عضویت</th><th></th></tr>${(r.results||[]).map((u:any)=>`<tr><td class="ltr">${u.telegram_id}</td><td>${webEsc(u.first_name||'')}</td><td>${u.username?'@'+webEsc(u.username):'—'}</td><td>${Number(u.balance||0).toFixed(2)}</td><td>${u.join_verified?'✅':'—'}</td><td><a class="btn" href="/admin-web?tab=users&id=${u.telegram_id}">باز کردن</a></td></tr>`).join('')}</table></div>`;
 }
 async function adminOrdersHtml(env:Env){const r:any=await env.DB.prepare("SELECT o.*,p.title FROM orders o JOIN products p ON p.id=o.product_id ORDER BY o.id DESC LIMIT 100").all();return `<div class="card"><h3>آخرین سفارش‌ها</h3><table><tr><th>سفارش</th><th>کاربر</th><th>محصول</th><th>فروش</th><th>هزینه</th><th>سود</th><th>وضعیت</th></tr>${(r.results||[]).map((o:any)=>`<tr><td>${webEsc(o.public_id)}</td><td class="ltr">${o.telegram_id}</td><td>${webEsc(o.title)} × ${o.quantity}</td><td>${Number(o.total_price).toFixed(2)}</td><td>${Number(o.cost_total||0).toFixed(2)}</td><td>${(Number(o.total_price)-Number(o.cost_total||0)).toFixed(2)}</td><td>${webEsc(o.status)}</td></tr>`).join('')}</table></div>`;}
-async function adminPaymentsHtml(env:Env){await refreshRates(env);const cfg=await paymentConfig(env);const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase();const auto=await getSetting(env,'ton_usd_rate_auto','0');const upd=await getSetting(env,'ton_usd_rate_updated_at','');const b=await bep20Status(env);return `<div class="card"><h3>BEP20 / USDT روی BSC</h3><p>وضعیت: <b>${!b.enabled?'غیرفعال':!b.ready?'تنظیم ناقص':b.testMode?'حالت تست':'فعال واقعی'}</b></p><p>Wallet: <span class="ltr">${webEsc(b.wallet||'—')}</span></p><p>Contract whitelist: <span class="ltr">${BSC_USDT_CONTRACT}</span></p><p>Chain ID: <b>56</b> | Confirmations: <b>${webEsc(await getSetting(env,'confirmations_bep20','5'))}</b></p><p class="muted">در حالت تست، فقط ادمین گزینه BEP20 را می‌بیند و تراکنش شناسایی می‌شود ولی Credit خودکار نمی‌گیرد.</p><form method="post" action="/admin-web"><input type="hidden" name="action" value="bep20_mode_toggle"><button class="btn ${b.testMode?'good':'warn'}">${b.testMode?'فعال‌کردن حالت واقعی':'برگشت به حالت تست'}</button></form><form method="post" action="/admin-web" style="margin-top:8px"><input type="hidden" name="action" value="bep20_feature_toggle"><button class="btn">${b.enabled?'غیرفعال‌کردن BEP20':'فعال‌کردن BEP20'}</button></form></div><div class="card" style="margin-top:14px"><h3>نرخ TON و پرداخت</h3><p>نرخ موثر فعلی: <b>$${Number(cfg.tonRate||0).toFixed(4)}</b></p><p class="muted">نرخ خودکار ذخیره‌شده: $${Number(auto||0).toFixed(4)} ${upd?`— ${webEsc(upd)}`:''}</p><form method="post" action="/admin-web"><input type="hidden" name="action" value="ton_rate_save"><div class="row"><div class="field"><label>حالت نرخ</label><select name="mode"><option value="auto" ${mode==='auto'?'selected':''}>خودکار (CoinGecko)</option><option value="manual" ${mode==='manual'?'selected':''}>دستی</option></select></div><div class="field"><label>نرخ دستی TON/USD</label><input type="number" step="0.0001" min="0" name="manual_rate" value="${webEsc(await getSetting(env,'ton_usd_rate',env.TON_USD_RATE||''))}"></div></div><button class="btn primary">ذخیره</button></form><form method="post" action="/admin-web" style="margin-top:10px"><input type="hidden" name="action" value="ton_rate_refresh"><button class="btn good">🔄 دریافت فوری نرخ خودکار</button></form><hr style="border-color:#24314e;margin:18px 0"><p>USD/TRY: <b>${(await getRate(env,'USDTRY'))||'—'}</b> | USD/IRR: <b>${(await getRate(env,'USDIRR'))||'—'}</b></p><p>🟡 BEP20: <span class="ltr">${webEsc(cfg.bep20||'غیرفعال')}</span></p><p>🔴 TRC20: <span class="ltr">${webEsc(cfg.trc20||'غیرفعال')}</span></p><p>💎 TON: <span class="ltr">${webEsc(cfg.ton||'غیرفعال')}</span></p><p>🏦 کارت: ${webEsc(cfg.card||'غیرفعال')} — ${webEsc(cfg.cardHolder||'')}</p></div>`;}
+async function adminPaymentsHtml(env:Env,url?:URL){await refreshRates(env);const cfg=await paymentConfig(env);const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase();const auto=await getSetting(env,'ton_usd_rate_auto','0');const upd=await getSetting(env,'ton_usd_rate_updated_at','');const b=await bep20Status(env);const test=String(url?.searchParams.get('test')||'');let diag='';if(['all','bep20','trc20','ton','card','rates'].includes(test))diag=diagnosticsHtml(await paymentDiagnostics(env,test));return `<div class="card"><h3>BEP20 / USDT روی BSC</h3><p>وضعیت: <b>${!b.enabled?'غیرفعال':!b.ready?'تنظیم ناقص':b.testMode?'حالت تست':'فعال واقعی'}</b></p><p>Wallet: <span class="ltr">${webEsc(b.wallet||'—')}</span></p><p>Contract whitelist: <span class="ltr">${BSC_USDT_CONTRACT}</span></p><p>Chain ID: <b>56</b> | Confirmations: <b>${webEsc(await getSetting(env,'confirmations_bep20','5'))}</b></p><p class="muted">Etherscan V2 در اولویت است و اگر در دسترس نباشد Scanner به BSC RPC fallback می‌رود.</p><form method="post" action="/admin-web"><input type="hidden" name="action" value="bep20_mode_toggle"><button class="btn ${b.testMode?'good':'warn'}">${b.testMode?'فعال‌کردن حالت واقعی':'برگشت به حالت تست'}</button></form><form method="post" action="/admin-web" style="margin-top:8px"><input type="hidden" name="action" value="bep20_feature_toggle"><button class="btn">${b.enabled?'غیرفعال‌کردن BEP20':'فعال‌کردن BEP20'}</button></form><div class="actions" style="margin-top:12px"><a class="btn good" href="/admin-web?tab=payments&test=all">🧪 تست همه روش‌ها</a><a class="btn" href="/admin-web?tab=payments&test=bep20">BEP20</a><a class="btn" href="/admin-web?tab=payments&test=trc20">TRC20</a><a class="btn" href="/admin-web?tab=payments&test=ton">TON</a><a class="btn" href="/admin-web?tab=payments&test=card">کارت</a><a class="btn" href="/admin-web?tab=payments&test=rates">Rates</a></div></div><div class="card" style="margin-top:14px"><h3>نرخ TON و پرداخت</h3><p>نرخ موثر فعلی: <b>$${Number(cfg.tonRate||0).toFixed(4)}</b></p><p class="muted">نرخ خودکار ذخیره‌شده: $${Number(auto||0).toFixed(4)} ${upd?`— ${webEsc(upd)}`:''}</p><form method="post" action="/admin-web"><input type="hidden" name="action" value="ton_rate_save"><div class="row"><div class="field"><label>حالت نرخ</label><select name="mode"><option value="auto" ${mode==='auto'?'selected':''}>خودکار (CoinGecko)</option><option value="manual" ${mode==='manual'?'selected':''}>دستی</option></select></div><div class="field"><label>نرخ دستی TON/USD</label><input type="number" step="0.0001" min="0" name="manual_rate" value="${webEsc(await getSetting(env,'ton_usd_rate',env.TON_USD_RATE||''))}"></div></div><button class="btn primary">ذخیره</button></form><form method="post" action="/admin-web" style="margin-top:10px"><input type="hidden" name="action" value="ton_rate_refresh"><button class="btn good">🔄 دریافت فوری نرخ خودکار</button></form><hr style="border-color:#24314e;margin:18px 0"><p>USD/TRY: <b>${(await getRate(env,'USDTRY'))||'—'}</b> | USD/IRR: <b>${(await getRate(env,'USDIRR'))||'—'}</b></p><p>🟡 BEP20: <span class="ltr">${webEsc(cfg.bep20||'غیرفعال')}</span></p><p>🔴 TRC20: <span class="ltr">${webEsc(cfg.trc20||'غیرفعال')}</span></p><p>💎 TON: <span class="ltr">${webEsc(cfg.ton||'غیرفعال')}</span></p><p>🏦 کارت: ${webEsc(cfg.card||'غیرفعال')} — ${webEsc(cfg.cardHolder||'')}</p></div>${diag}`;}
 
 async function adminOperationsHtml(env:Env){const m=await maintenanceOn(env);const features=[['feature_shop','فروشگاه'],['feature_crypto','کریپتو'],['feature_card','کارت'],['feature_referral','Referral'],['feature_support','پشتیبانی'],['feature_broadcast','Broadcast']];let fs='';for(const [k,l] of features)fs+=`<tr><td>${webEsc(l)}</td><td>${await featureEnabled(env,k,true)?'🟢 فعال':'⚪ غیرفعال'}</td><td><form method="post" action="/admin-web"><input type="hidden" name="action" value="feature_toggle"><input type="hidden" name="key" value="${k}"><button class="btn">تغییر</button></form></td></tr>`;return `<div class="card"><h3>عملیات و Feature Flags</h3><p>حالت نگهداری: <b>${m?'🔴 فعال':'🟢 غیرفعال'}</b></p><form method="post" action="/admin-web"><input type="hidden" name="action" value="maintenance_toggle"><button class="btn ${m?'good':'bad'}">${m?'خاموش کردن':'فعال کردن'} نگهداری</button></form><table><tr><th>قابلیت</th><th>وضعیت</th><th></th></tr>${fs}</table></div>`;}
 function adminBackupHtml(){return `<div class="card"><h3>Backup / Export</h3><p class="muted">خروجی JSON از داده‌های اصلی. فایل‌ها فقط با Session معتبر ادمین قابل دریافت‌اند.</p><div class="actions"><a class="btn" href="/admin-web/export?type=users">Users</a><a class="btn" href="/admin-web/export?type=orders">Orders</a><a class="btn" href="/admin-web/export?type=ledger">Ledger</a><a class="btn" href="/admin-web/export?type=payments">Payments</a><a class="btn" href="/admin-web/export?type=settings">Settings</a><a class="btn good" href="/admin-web/export?type=all">Full Backup</a></div></div>`;}
-async function exportAdminData(env:Env,type:string){const allowed=new Set(['users','orders','ledger','payments','settings','all']);if(!allowed.has(type))type='all';const out:any={exported_at:nowIso(),version:'0.7.1'};const load=async(name:string,sql:string)=>{const r:any=await env.DB.prepare(sql).all();out[name]=r.results||[];};if(type==='users'||type==='all')await load('users','SELECT * FROM users ORDER BY id');if(type==='orders'||type==='all')await load('orders','SELECT * FROM orders ORDER BY id');if(type==='ledger'||type==='all')await load('ledger','SELECT * FROM credit_ledger ORDER BY id');if(type==='payments'||type==='all'){await load('payment_invoices','SELECT * FROM payment_invoices ORDER BY id');await load('payment_events','SELECT * FROM payment_events ORDER BY id');}if(type==='settings'||type==='all')await load('bot_settings','SELECT * FROM bot_settings ORDER BY key');if(type==='all'){await load('products','SELECT * FROM products ORDER BY id');await load('categories','SELECT * FROM shop_categories ORDER BY id');await load('referrals','SELECT * FROM referrals ORDER BY id');await load('support_tickets','SELECT * FROM support_tickets ORDER BY id');await load('admin_logs','SELECT * FROM admin_logs ORDER BY id');await load('risk_blacklist','SELECT * FROM risk_blacklist ORDER BY id');await load('rate_quotes','SELECT * FROM rate_quotes ORDER BY pair');}return out;}
+async function exportAdminData(env:Env,type:string){const allowed=new Set(['users','orders','ledger','payments','settings','all']);if(!allowed.has(type))type='all';const out:any={exported_at:nowIso(),version:'0.7.3'};const load=async(name:string,sql:string)=>{const r:any=await env.DB.prepare(sql).all();out[name]=r.results||[];};if(type==='users'||type==='all')await load('users','SELECT * FROM users ORDER BY id');if(type==='orders'||type==='all')await load('orders','SELECT * FROM orders ORDER BY id');if(type==='ledger'||type==='all')await load('ledger','SELECT * FROM credit_ledger ORDER BY id');if(type==='payments'||type==='all'){await load('payment_invoices','SELECT * FROM payment_invoices ORDER BY id');await load('payment_events','SELECT * FROM payment_events ORDER BY id');}if(type==='settings'||type==='all')await load('bot_settings','SELECT * FROM bot_settings ORDER BY key');if(type==='all'){await load('products','SELECT * FROM products ORDER BY id');await load('categories','SELECT * FROM shop_categories ORDER BY id');await load('referrals','SELECT * FROM referrals ORDER BY id');await load('support_tickets','SELECT * FROM support_tickets ORDER BY id');await load('admin_logs','SELECT * FROM admin_logs ORDER BY id');await load('risk_blacklist','SELECT * FROM risk_blacklist ORDER BY id');await load('rate_quotes','SELECT * FROM rate_quotes ORDER BY pair');}return out;}
 
 async function handleWebAdmin(req:Request,env:Env,url:URL):Promise<Response|null>{
   if(!url.pathname.startsWith('/admin-web'))return null;
@@ -1109,7 +1177,7 @@ async function handleWebAdmin(req:Request,env:Env,url:URL):Promise<Response|null
     return new Response('unknown action',{status:400});
   }
   const session:any=await validAdminSession(req,env);if(!session)return loginPage();
-  const tab=url.searchParams.get('tab')||'dashboard';let body='';if(tab==='products')body=await adminProductsHtml(env,url);else if(tab==='users')body=await adminUsersHtml(env,url);else if(tab==='orders')body=await adminOrdersHtml(env);else if(tab==='payments')body=await adminPaymentsHtml(env);else if(tab==='operations')body=await adminOperationsHtml(env);else if(tab==='backup')body=adminBackupHtml();else body=await adminDashboardHtml(env);return new Response(webPage('Admin',body,tab,String(session.csrf_token||'')),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-frame-options':'DENY','content-security-policy':"default-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",'referrer-policy':'no-referrer','x-content-type-options':'nosniff'}});
+  const tab=url.searchParams.get('tab')||'dashboard';let body='';if(tab==='products')body=await adminProductsHtml(env,url);else if(tab==='users')body=await adminUsersHtml(env,url);else if(tab==='orders')body=await adminOrdersHtml(env);else if(tab==='payments')body=await adminPaymentsHtml(env,url);else if(tab==='operations')body=await adminOperationsHtml(env);else if(tab==='backup')body=adminBackupHtml();else body=await adminDashboardHtml(env);return new Response(webPage('Admin',body,tab,String(session.csrf_token||'')),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-frame-options':'DENY','content-security-policy':"default-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",'referrer-policy':'no-referrer','x-content-type-options':'nosniff'}});
 }
 
 function setupWebhookPage(msg=''){return new Response(`<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Webhook Setup</title><style>body{font-family:system-ui;background:#0b1020;color:#fff;display:grid;place-items:center;min-height:100vh}.box{width:min(92vw,520px);background:#121a2d;padding:24px;border-radius:16px;border:1px solid #263454}input,button{width:100%;box-sizing:border-box;padding:12px;margin-top:10px;border-radius:10px;border:1px solid #314267;background:#0c1427;color:#fff}button{background:#315da8}</style><div class="box"><h2>تنظیم Webhook</h2><p>SETUP_SECRET را وارد کن. Secret داخل URL یا history ذخیره نمی‌شود.</p>${msg?`<p>${webEsc(msg)}</p>`:''}<form method="post" action="/setup-webhook"><input type="password" name="secret" autocomplete="off" required><button>ثبت Webhook</button></form></div></html>`,{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','referrer-policy':'no-referrer','x-frame-options':'DENY'}});}
