@@ -1,6 +1,6 @@
-# Nexora Commerce Bot v0.7.2
+# Nexora Commerce Bot v0.7.4
 
-> v0.7.2: BEP20 hardened scanner با Contract whitelist، Chain ID 56، 5 confirmation پیش‌فرض و Test Mode امن. راهنمای ارتقا: `UPGRADE_V071_FA.md`.
+> v0.7.4: منوی مرتب‌تر، Rate Engine چندمنبعی با fallback/cache، و فاکتور تست واقعی BEP20 در TEST Mode. راهنمای ارتقا: `UPGRADE_V074_FA.md`.
 
 # Nexora Commerce Bot — v0.7 Operations Suite
 

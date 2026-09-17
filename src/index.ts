@@ -154,10 +154,11 @@ async function balance(env:Env,uid:number){
 
 async function menu(env:Env,uid:number):Promise<Btn[][]>{
   const rows:Btn[][]=[];
-  if(await featureEnabled(env,'feature_shop',true))rows.push([{text:'🛍 فروشگاه',callback_data:'shop:list'}]);
-  rows.push([{text:'💳 خرید اعتبار',callback_data:'credit:buy'},{text:'💰 موجودی',callback_data:'balance'}]);
-  const r:Btn[]=[{text:'📜 تاریخچه',callback_data:'history:menu'}];if(await featureEnabled(env,'feature_referral',true))r.push({text:'🎁 دعوت و درآمد',callback_data:'referral'});rows.push(r);
-  const last:Btn[]=[{text:'🟢 وضعیت سرویس',callback_data:'status'}];if(await featureEnabled(env,'feature_support',true))last.push({text:'🆘 پشتیبانی',callback_data:'support:menu'});rows.push(last);
+  if(await featureEnabled(env,'feature_shop',true))rows.push([{text:'🛍 فروشگاه',callback_data:'shop:list'},{text:'💰 کیف پول',callback_data:'balance'}]);
+  else rows.push([{text:'💰 کیف پول',callback_data:'balance'}]);
+  rows.push([{text:'💳 افزایش اعتبار',callback_data:'credit:buy'},{text:'📜 سفارش‌ها و تاریخچه',callback_data:'history:menu'}]);
+  const community:Btn[]=[];if(await featureEnabled(env,'feature_referral',true))community.push({text:'🎁 دعوت و درآمد',callback_data:'referral'});if(await featureEnabled(env,'feature_support',true))community.push({text:'🆘 پشتیبانی',callback_data:'support:menu'});if(community.length)rows.push(community);
+  rows.push([{text:'🟢 وضعیت سرویس',callback_data:'status'}]);
   if(isAdmin(env,uid))rows.push([{text:'🛠 ورود به حالت مدیریت',callback_data:'admin:home'}]);
   return rows;
 }
@@ -217,26 +218,29 @@ async function refreshRates(env:Env,force=false){
   const irrMode=(await getSetting(env,'rate_usd_irr_mode','manual')).toLowerCase();if(irrMode==='manual'){const v=Number(await getSetting(env,'rate_usd_irr_manual','0'));if(v>0)await setRateQuote(env,'USDIRR',v,'manual','manual');}
   const tryMode=(await getSetting(env,'rate_usd_try_mode','auto')).toLowerCase();if(tryMode==='manual'){const v=Number(await getSetting(env,'rate_usd_try_manual','0'));if(v>0)await setRateQuote(env,'USDTRY',v,'manual','manual');}
 }
+async function fetchTonRateSource(url:string,extract:(d:any)=>number,headers:any={accept:'application/json'}){
+  try{const r=await fetch(url,{headers});const raw=await r.text();let d:any=null;try{d=JSON.parse(raw)}catch{}const rate=Number(extract(d)||0);return {ok:r.ok&&Number.isFinite(rate)&&rate>0,rate,status:r.status,message:r.ok?(rate>0?String(rate):'invalid_rate'):`HTTP ${r.status}`};}
+  catch(e:any){return {ok:false,rate:0,status:0,message:String(e?.message||e).slice(0,120)};}
+}
+async function tonRateProviders(){
+  const cg=await fetchTonRateSource('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',d=>Number(d?.['the-open-network']?.usd||0),{'accept':'application/json','user-agent':'Nexora-Commerce-Bot/0.7.4'});if(cg.ok)return {rate:cg.rate,source:'CoinGecko',details:`CoinGecko ${cg.rate}`};
+  const bn=await fetchTonRateSource('https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT',d=>Number(d?.price||0));if(bn.ok)return {rate:bn.rate,source:'Binance',details:`Binance ${bn.rate}`};
+  const bn2=await fetchTonRateSource('https://api.binance.com/api/v3/avgPrice?symbol=TONUSDT',d=>Number(d?.price||0));if(bn2.ok)return {rate:bn2.rate,source:'BinanceAvg',details:`BinanceAvg ${bn2.rate}`};
+  return {rate:0,source:'',details:`CoinGecko ${cg.message}; Binance ${bn.message}; BinanceAvg ${bn2.message}`};
+}
 async function refreshTonRate(env:Env,force=false){
   const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase();
   if(mode!=='auto'&&!force)return null;
   const lastRaw=await getSetting(env,'ton_usd_rate_updated_at','');
   const last=lastRaw?Date.parse(lastRaw):0;
-  if(!force&&last&&Date.now()-last<10*60*1000){
-    const cached=Number(await getSetting(env,'ton_usd_rate_auto','0'))||0;
-    return cached||null;
-  }
-  try{
-    const r=await fetch('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',{headers:{'accept':'application/json','user-agent':'Nexora-Commerce-Bot/0.7.3'}});
-    if(!r.ok)throw new Error(`rate_http_${r.status}`);
-    const data:any=await r.json(); const rate=Number(data?.['the-open-network']?.usd||0);
-    if(!Number.isFinite(rate)||rate<=0)throw new Error('invalid_rate');
-    await env.DB.batch([
-      env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('ton_usd_rate_auto',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(String(rate)),
-      env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('ton_usd_rate_updated_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(nowIso())
-    ]);
-    return rate;
-  }catch(e){console.log('TON rate refresh failed',String(e));return null;}
+  if(!force&&last&&Date.now()-last<10*60*1000){const cached=Number(await getSetting(env,'ton_usd_rate_auto','0'))||0;return cached||null;}
+  const hit=await tonRateProviders();
+  if(hit.rate>0){await env.DB.batch([
+    env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('ton_usd_rate_auto',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(String(hit.rate)),
+    env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('ton_usd_rate_updated_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(nowIso()),
+    env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('ton_usd_rate_source',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(hit.source)
+  ]);return hit.rate;}
+  console.log('TON rate refresh failed',hit.details);return null;
 }
 async function effectiveTonRate(env:Env){
   const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase();
@@ -430,10 +434,11 @@ async function diagnoseCard(env:Env):Promise<MethodDiagnostic>{
   return {name:'کارت به کارت',ok:feature&&numberOk&&holderOk,lines:[`${okMark(feature)} Feature: ${feature?'فعال':'غیرفعال'}`,`${okMark(numberOk)} شماره کارت: ${numberOk?`•••• ${digits.slice(-4)}`:'نامعتبر/تنظیم نشده'}`,`${okMark(holderOk)} صاحب کارت: ${holderOk?cfg.cardHolder:'تنظیم نشده'}`,'ℹ️ این روش تأیید دستی است و API بانکی ندارد.']};
 }
 async function diagnoseRates(env:Env):Promise<MethodDiagnostic>{
-  let cg=false,fr=false,cgMsg='',frMsg='';
-  try{const r=await fetch('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',{headers:{accept:'application/json','user-agent':'Nexora-Commerce-Bot/0.7.3'}});const d:any=await r.json().catch(()=>null);cg=r.ok&&Number(d?.['the-open-network']?.usd)>0;cgMsg=cg?`TON/USD=${Number(d['the-open-network'].usd)}`:`HTTP ${r.status}`;}catch(e:any){cgMsg=String(e?.message||e).slice(0,120);}
+  const provider=await tonRateProviders();let fr=false,frMsg='';
   try{const r=await fetch('https://api.frankfurter.app/latest?from=USD&to=TRY',{headers:{accept:'application/json'}});const d:any=await r.json().catch(()=>null);fr=r.ok&&Number(d?.rates?.TRY)>0;frMsg=fr?`USD/TRY=${Number(d.rates.TRY)}`:`HTTP ${r.status}`;}catch(e:any){frMsg=String(e?.message||e).slice(0,120);}
-  const irr=Number(await getSetting(env,'rate_usd_irr_manual','0'))||0;return {name:'Rate Engine',ok:cg&&fr,lines:[`${cg?'✅':'❌'} CoinGecko: ${cgMsg}`,`${fr?'✅':'❌'} Frankfurter: ${frMsg}`,`${irr>0?'✅':'⚠️'} USD/IRR manual: ${irr>0?irr:'تنظیم نشده'}`]};
+  const cached=Number(await getSetting(env,'ton_usd_rate_auto','0'))||0;const source=await getSetting(env,'ton_usd_rate_source','');const manualTon=Number(await getSetting(env,'ton_usd_rate',env.TON_USD_RATE||'0'))||0;const irr=Number(await getSetting(env,'rate_usd_irr_manual','0'))||0;
+  const tonOperational=provider.rate>0||cached>0||manualTon>0;const tonLine=provider.rate>0?`✅ TON/USD live: ${provider.rate.toFixed(4)} (${provider.source})`:cached>0?`⚠️ TON/USD cached: ${cached.toFixed(4)}${source?` (${source})`:''}`:manualTon>0?`⚠️ TON/USD manual fallback: ${manualTon.toFixed(4)}`:`❌ TON/USD: هیچ منبع معتبری موجود نیست`;
+  return {name:'Rate Engine',ok:tonOperational&&fr,lines:[tonLine,provider.rate>0?'✅ Provider fallback chain: عملیاتی':`⚠️ Provider live: ${provider.details}`,`${fr?'✅':'❌'} Frankfurter: ${frMsg}`,`${irr>0?'✅':'⚠️'} USD/IRR manual: ${irr>0?irr:'تنظیم نشده'}`]};
 }
 async function paymentDiagnostics(env:Env,which='all'){const out:MethodDiagnostic[]=[];if(which==='all'||which==='bep20')out.push(await diagnoseBep20(env));if(which==='all'||which==='trc20')out.push(await diagnoseTrc20(env));if(which==='all'||which==='ton')out.push(await diagnoseTon(env));if(which==='all'||which==='card')out.push(await diagnoseCard(env));if(which==='all'||which==='rates')out.push(await diagnoseRates(env));return out;}
 function diagnosticsTelegramText(items:MethodDiagnostic[]){let t='🧪 <b>تست روش‌های پرداخت</b>\n';for(const x of items){t+=`\n${x.ok?'✅':'❌'} <b>${esc(x.name)}</b>\n${x.lines.map(v=>esc(v)).join('\n')}\n`;}return t.slice(0,3900);}
@@ -690,18 +695,35 @@ async function showAdmin(env:Env,chat:number,mid?:number){
   const cards:any=await env.DB.prepare("SELECT COUNT(*) c FROM payment_invoices WHERE method='card' AND status='manual_review'").first();
   const tickets:any=await env.DB.prepare("SELECT COUNT(*) c FROM support_tickets WHERE status='open'").first();
   const products:any=await env.DB.prepare('SELECT COUNT(*) c FROM products WHERE enabled=1').first();
-  const t=`🛠 <b>پنل مدیریت</b>\n\n👥 کاربران: <b>${Number(users?.c||0)}</b>\n🏦 رسید در انتظار: <b>${Number(cards?.c||0)}</b>\n🎫 تیکت باز: <b>${Number(tickets?.c||0)}</b>\n🛍 محصولات فعال: <b>${Number(products?.c||0)}</b>`;
+  const t=`🛠 <b>مرکز مدیریت</b>
+
+👥 کاربران: <b>${Number(users?.c||0)}</b> | 🛍 محصولات: <b>${Number(products?.c||0)}</b>
+🏦 بررسی پرداخت: <b>${Number(cards?.c||0)}</b> | 🎫 تیکت باز: <b>${Number(tickets?.c||0)}</b>
+
+یک بخش را انتخاب کن:`;
   const rows:Btn[][]=[
-    [{text:'🛍 محصولات',callback_data:'admin:products'},{text:'📦 استوک',callback_data:'admin:stock'}],
-    [{text:'🗂 دسته‌بندی‌ها',callback_data:'admin:categories'},{text:'🏷 کدهای تخفیف',callback_data:'admin:discounts'}],
-    [{text:'📢 جوین اجباری',callback_data:'admin:channels'},{text:'💳 تنظیمات پرداخت',callback_data:'admin:payments'}],
-    [{text:'🧾 سفارش‌ها / Refund',callback_data:'admin:orders'},{text:'🎫 تیکت‌ها',callback_data:'admin:tickets'}],
-    [{text:'📣 Broadcast',callback_data:'admin:broadcast'},{text:'🔄 اسکن کریپتو',callback_data:'admin:scan'}],
-    [{text:'🛡 ریسک و Ban',callback_data:'admin:risk'},{text:'⚙️ قابلیت‌ها',callback_data:'admin:features'}],
-    [{text:'📈 نرخ‌ها',callback_data:'admin:rates'},{text:'🧰 نگهداری',callback_data:'admin:maintenance'}],
-    [{text:'📊 آمار',callback_data:'admin:stats'}],[{text:'🏠 منوی کاربر',callback_data:'menu'}]
+    [{text:'🛍 فروش و محتوا',callback_data:'admin:section:commerce'},{text:'💳 مالی و پرداخت',callback_data:'admin:section:finance'}],
+    [{text:'👥 کاربران و پشتیبانی',callback_data:'admin:section:users'},{text:'⚙️ سیستم و امنیت',callback_data:'admin:section:system'}],
+    [{text:'📊 آمار کلی',callback_data:'admin:stats'}],
+    [{text:'🏠 خروج از حالت مدیریت',callback_data:'menu'}]
   ];
   mid?await edit(env,chat,mid,t,rows):await send(env,chat,t,rows);
+}
+async function adminSection(env:Env,chat:number,mid:number,section:string){
+  const back={text:'⬅️ مرکز مدیریت',callback_data:'admin:home'};let t='';let rows:Btn[][]=[];
+  if(section==='commerce'){t=`🛍 <b>فروش و محتوا</b>
+
+مدیریت کاتالوگ، موجودی و فروش.`;rows=[[{text:'🛍 محصولات',callback_data:'admin:products'},{text:'📦 استوک',callback_data:'admin:stock'}],[{text:'🗂 دسته‌بندی‌ها',callback_data:'admin:categories'},{text:'🏷 کدهای تخفیف',callback_data:'admin:discounts'}],[{text:'🧾 سفارش‌ها / Refund',callback_data:'admin:orders'}],[back]];}
+  else if(section==='finance'){t=`💳 <b>مالی و پرداخت</b>
+
+شبکه‌ها، نرخ‌ها و بررسی پرداخت.`;rows=[[{text:'💳 تنظیمات پرداخت',callback_data:'admin:payments'},{text:'📈 نرخ‌ها',callback_data:'admin:rates'}],[{text:'🔄 اسکن کریپتو',callback_data:'admin:scan'},{text:'🧪 تست پرداخت‌ها',callback_data:'admin:paytest:all'}],[back]];}
+  else if(section==='users'){t=`👥 <b>کاربران و پشتیبانی</b>
+
+مدیریت ارتباط با کاربران و Referral.`;rows=[[{text:'🎫 تیکت‌ها',callback_data:'admin:tickets'},{text:'🛡 ریسک و Ban',callback_data:'admin:risk'}],[{text:'🎁 تنظیمات Referral',callback_data:'admin:referral:settings'},{text:'📣 Broadcast',callback_data:'admin:broadcast'}],[{text:'📢 جوین اجباری',callback_data:'admin:channels'}],[back]];}
+  else {t=`⚙️ <b>سیستم و امنیت</b>
+
+کنترل قابلیت‌ها و وضعیت عملیاتی.`;rows=[[{text:'⚙️ قابلیت‌ها',callback_data:'admin:features'},{text:'🧰 نگهداری',callback_data:'admin:maintenance'}],[{text:'🚫 Blacklist',callback_data:'admin:blacklist'},{text:'📊 آمار',callback_data:'admin:stats'}],[back]];}
+  return edit(env,chat,mid,t,rows);
 }
 async function adminProducts(env:Env,chat:number,mid:number){
   const q:any=await env.DB.prepare("SELECT p.*,(SELECT COUNT(*) FROM product_stock s WHERE s.product_id=p.id AND s.status='available') stock FROM products p ORDER BY id DESC LIMIT 20").all();
@@ -764,10 +786,35 @@ async function adminDiscounts(env:Env,chat:number,mid:number){
 }
 async function adminPayments(env:Env,chat:number,mid:number){
   const c=await paymentConfig(env); const short=(x:string)=>x?`${x.slice(0,8)}…${x.slice(-6)}`:'تنظیم نشده';
-  const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase(); const updated=await getSetting(env,'ton_usd_rate_updated_at','');const b=await bep20Status(env);
+  const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase(); const updated=await getSetting(env,'ton_usd_rate_updated_at','');const source=await getSetting(env,'ton_usd_rate_source','');const b=await bep20Status(env);
   const bepState=!b.enabled?'⚪ غیرفعال':!b.ready?'🔴 تنظیم ناقص':b.testMode?'🧪 تست':'🟢 واقعی';
-  const t=`💳 <b>تنظیمات پرداخت</b>\n\n🟡 BEP20: <code>${esc(short(c.bep20))}</code> — <b>${bepState}</b>\n🔐 Contract: <code>${BSC_USDT_CONTRACT}</code>\n⛓ Chain ID: <b>56</b> | Confirmations: <b>${await getSetting(env,'confirmations_bep20','5')}</b>\n🔴 TRC20: <code>${esc(short(c.trc20))}</code>\n💎 TON: <code>${esc(short(c.ton))}</code>\n📈 نرخ TON/USD: <b>${c.tonRate||'تنظیم نشده'}</b>\n🤖 حالت نرخ TON: <b>${mode==='auto'?'خودکار':'دستی'}</b>${updated?`\n🕒 آخرین نرخ خودکار: ${esc(updated)}`:''}\n🏦 کارت: <code>${esc(c.card||'تنظیم نشده')}</code>\n👤 صاحب کارت: <b>${esc(c.cardHolder||'—')}</b>`;
-  await edit(env,chat,mid,t,[[{text:'🟡 آدرس BEP20',callback_data:'admin:payset:wallet_bep20'},{text:'🔴 آدرس TRC20',callback_data:'admin:payset:wallet_trc20'}],[{text:b.testMode?'🧪 BEP20: تست':'🟢 BEP20: واقعی',callback_data:'admin:bep20:mode'},{text:b.enabled?'⏸ خاموش BEP20':'▶️ روشن BEP20',callback_data:'admin:bep20:toggle'}],[{text:'🧪 تست همه روش‌ها',callback_data:'admin:paytest:all'}],[{text:'🟡 تست BEP20',callback_data:'admin:paytest:bep20'},{text:'🔴 تست TRC20',callback_data:'admin:paytest:trc20'}],[{text:'💎 تست TON',callback_data:'admin:paytest:ton'},{text:'🏦 تست کارت',callback_data:'admin:paytest:card'}],[{text:'📈 تست Rate Engine',callback_data:'admin:paytest:rates'}],[{text:'💎 آدرس TON',callback_data:'admin:payset:wallet_ton'},{text:'📈 نرخ دستی TON',callback_data:'admin:payset:ton_usd_rate'}],[{text:mode==='auto'?'✅ نرخ خودکار':'🤖 فعال‌کردن نرخ خودکار',callback_data:'admin:tonrate:auto'},{text:'🔄 بروزرسانی نرخ',callback_data:'admin:tonrate:refresh'}],[{text:'✍️ حالت دستی',callback_data:'admin:tonrate:manual'}],[{text:'🏦 شماره کارت',callback_data:'admin:payset:card_number'},{text:'👤 صاحب کارت',callback_data:'admin:payset:card_holder'}],[{text:'⬅️ پنل مدیریت',callback_data:'admin:home'}]]);
+  const t=`💳 <b>تنظیمات پرداخت</b>
+
+<b>شبکه‌ها</b>
+🟡 BEP20: <code>${esc(short(c.bep20))}</code> — <b>${bepState}</b>
+🔴 TRC20: <code>${esc(short(c.trc20))}</code>
+💎 TON: <code>${esc(short(c.ton))}</code>
+
+<b>نرخ</b>
+📈 TON/USD: <b>${c.tonRate||'تنظیم نشده'}</b>${source?` — ${esc(source)}`:''}
+🤖 حالت: <b>${mode==='auto'?'خودکار':'دستی'}</b>${updated?`
+🕒 بروزرسانی: ${esc(updated)}`:''}
+
+<b>کارت</b>
+🏦 <code>${esc(c.card||'تنظیم نشده')}</code>
+👤 <b>${esc(c.cardHolder||'—')}</b>`;
+  await edit(env,chat,mid,t,[
+    [{text:'🧪 تست همه روش‌ها',callback_data:'admin:paytest:all'}],
+    [{text:'🟡 BEP20',callback_data:'admin:paytest:bep20'},{text:'🔴 TRC20',callback_data:'admin:paytest:trc20'},{text:'💎 TON',callback_data:'admin:paytest:ton'}],
+    [{text:'🏦 کارت',callback_data:'admin:paytest:card'},{text:'📈 Rate Engine',callback_data:'admin:paytest:rates'}],
+    [{text:'🟡 آدرس BEP20',callback_data:'admin:payset:wallet_bep20'},{text:'🔴 آدرس TRC20',callback_data:'admin:payset:wallet_trc20'}],
+    [{text:'💎 آدرس TON',callback_data:'admin:payset:wallet_ton'},{text:'🏦 شماره کارت',callback_data:'admin:payset:card_number'}],
+    [{text:b.testMode?'🧪 BEP20: TEST':'🟢 BEP20: LIVE',callback_data:'admin:bep20:mode'},{text:b.enabled?'⏸ خاموش BEP20':'▶️ روشن BEP20',callback_data:'admin:bep20:toggle'}],
+    ...(b.testMode?[[{text:'💸 ساخت فاکتور تست واقعی BEP20',callback_data:'admin:bep20:testinvoice'}]]:[]),
+    [{text:mode==='auto'?'✅ نرخ خودکار':'🤖 نرخ خودکار',callback_data:'admin:tonrate:auto'},{text:'🔄 بروزرسانی نرخ',callback_data:'admin:tonrate:refresh'}],
+    [{text:'✍️ نرخ دستی TON',callback_data:'admin:payset:ton_usd_rate'},{text:'👤 صاحب کارت',callback_data:'admin:payset:card_holder'}],
+    [{text:'⬅️ مالی و پرداخت',callback_data:'admin:section:finance'}]
+  ]);
 }
 async function adminOrders(env:Env,chat:number,mid:number){
   const q:any=await env.DB.prepare("SELECT o.*,p.title FROM orders o JOIN products p ON p.id=o.product_id ORDER BY o.id DESC LIMIT 20").all();
@@ -984,6 +1031,7 @@ async function handleCallback(env:Env,c:CallbackQuery){
 
   if(!isAdmin(env,uid))return;
   if(d==='admin:home'){await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run();return showAdmin(env,chat,mid);}
+  if(d.startsWith('admin:section:'))return adminSection(env,chat,mid,d.split(':')[2]);
   if(d==='admin:features')return adminFeatures(env,chat,mid);
   if(d==='admin:referral:settings')return adminReferralSettings(env,chat,mid);
   if(d==='admin:referral:trigger'){const rs=await referralSettings(env);await setSetting(env,'referral_reward_trigger',rs.trigger==='first_purchase'?'join':'first_purchase');return adminReferralSettings(env,chat,mid);}
@@ -1007,6 +1055,10 @@ async function handleCallback(env:Env,c:CallbackQuery){
   if(d==='admin:scan'){const n=await scanPendingCrypto(env); await logAdmin(env,uid,'crypto_scan',undefined,undefined,`settled=${n}`);return answerCb(env,c.id,`${n} پرداخت جدید تأیید شد.`,true);}
   if(d==='admin:bep20:mode'){const b=await bep20Status(env);await setSetting(env,'bep20_test_mode',b.testMode?'0':'1');await logAdmin(env,uid,'bep20_mode','setting','bep20_test_mode',b.testMode?'live':'test');return adminPayments(env,chat,mid);}
   if(d==='admin:bep20:toggle'){const b=await bep20Status(env);await setSetting(env,'feature_bep20',b.enabled?'0':'1');await logAdmin(env,uid,'bep20_toggle','setting','feature_bep20',b.enabled?'off':'on');return adminPayments(env,chat,mid);}
+  if(d==='admin:bep20:testinvoice'){
+    const b=await bep20Status(env);if(!b.testMode)return answerCb(env,c.id,'BEP20 در حالت LIVE است.',true);if(!b.ready)return answerCb(env,c.id,'تنظیمات BEP20 کامل نیست.',true);
+    await answerCb(env,c.id,'فاکتور تست ساخته شد.');return showCryptoInvoice(env,chat,mid,uid,0.10,0.10,'BEP20');
+  }
   if(d==='admin:bep20:check'||d.startsWith('admin:paytest:')){
     const which=d==='admin:bep20:check'?'bep20':d.split(':')[2];
     await answerCb(env,c.id,'در حال تست…');
@@ -1137,7 +1189,7 @@ async function adminPaymentsHtml(env:Env,url?:URL){await refreshRates(env);const
 
 async function adminOperationsHtml(env:Env){const m=await maintenanceOn(env);const features=[['feature_shop','فروشگاه'],['feature_crypto','کریپتو'],['feature_card','کارت'],['feature_referral','Referral'],['feature_support','پشتیبانی'],['feature_broadcast','Broadcast']];let fs='';for(const [k,l] of features)fs+=`<tr><td>${webEsc(l)}</td><td>${await featureEnabled(env,k,true)?'🟢 فعال':'⚪ غیرفعال'}</td><td><form method="post" action="/admin-web"><input type="hidden" name="action" value="feature_toggle"><input type="hidden" name="key" value="${k}"><button class="btn">تغییر</button></form></td></tr>`;return `<div class="card"><h3>عملیات و Feature Flags</h3><p>حالت نگهداری: <b>${m?'🔴 فعال':'🟢 غیرفعال'}</b></p><form method="post" action="/admin-web"><input type="hidden" name="action" value="maintenance_toggle"><button class="btn ${m?'good':'bad'}">${m?'خاموش کردن':'فعال کردن'} نگهداری</button></form><table><tr><th>قابلیت</th><th>وضعیت</th><th></th></tr>${fs}</table></div>`;}
 function adminBackupHtml(){return `<div class="card"><h3>Backup / Export</h3><p class="muted">خروجی JSON از داده‌های اصلی. فایل‌ها فقط با Session معتبر ادمین قابل دریافت‌اند.</p><div class="actions"><a class="btn" href="/admin-web/export?type=users">Users</a><a class="btn" href="/admin-web/export?type=orders">Orders</a><a class="btn" href="/admin-web/export?type=ledger">Ledger</a><a class="btn" href="/admin-web/export?type=payments">Payments</a><a class="btn" href="/admin-web/export?type=settings">Settings</a><a class="btn good" href="/admin-web/export?type=all">Full Backup</a></div></div>`;}
-async function exportAdminData(env:Env,type:string){const allowed=new Set(['users','orders','ledger','payments','settings','all']);if(!allowed.has(type))type='all';const out:any={exported_at:nowIso(),version:'0.7.3'};const load=async(name:string,sql:string)=>{const r:any=await env.DB.prepare(sql).all();out[name]=r.results||[];};if(type==='users'||type==='all')await load('users','SELECT * FROM users ORDER BY id');if(type==='orders'||type==='all')await load('orders','SELECT * FROM orders ORDER BY id');if(type==='ledger'||type==='all')await load('ledger','SELECT * FROM credit_ledger ORDER BY id');if(type==='payments'||type==='all'){await load('payment_invoices','SELECT * FROM payment_invoices ORDER BY id');await load('payment_events','SELECT * FROM payment_events ORDER BY id');}if(type==='settings'||type==='all')await load('bot_settings','SELECT * FROM bot_settings ORDER BY key');if(type==='all'){await load('products','SELECT * FROM products ORDER BY id');await load('categories','SELECT * FROM shop_categories ORDER BY id');await load('referrals','SELECT * FROM referrals ORDER BY id');await load('support_tickets','SELECT * FROM support_tickets ORDER BY id');await load('admin_logs','SELECT * FROM admin_logs ORDER BY id');await load('risk_blacklist','SELECT * FROM risk_blacklist ORDER BY id');await load('rate_quotes','SELECT * FROM rate_quotes ORDER BY pair');}return out;}
+async function exportAdminData(env:Env,type:string){const allowed=new Set(['users','orders','ledger','payments','settings','all']);if(!allowed.has(type))type='all';const out:any={exported_at:nowIso(),version:'0.7.4'};const load=async(name:string,sql:string)=>{const r:any=await env.DB.prepare(sql).all();out[name]=r.results||[];};if(type==='users'||type==='all')await load('users','SELECT * FROM users ORDER BY id');if(type==='orders'||type==='all')await load('orders','SELECT * FROM orders ORDER BY id');if(type==='ledger'||type==='all')await load('ledger','SELECT * FROM credit_ledger ORDER BY id');if(type==='payments'||type==='all'){await load('payment_invoices','SELECT * FROM payment_invoices ORDER BY id');await load('payment_events','SELECT * FROM payment_events ORDER BY id');}if(type==='settings'||type==='all')await load('bot_settings','SELECT * FROM bot_settings ORDER BY key');if(type==='all'){await load('products','SELECT * FROM products ORDER BY id');await load('categories','SELECT * FROM shop_categories ORDER BY id');await load('referrals','SELECT * FROM referrals ORDER BY id');await load('support_tickets','SELECT * FROM support_tickets ORDER BY id');await load('admin_logs','SELECT * FROM admin_logs ORDER BY id');await load('risk_blacklist','SELECT * FROM risk_blacklist ORDER BY id');await load('rate_quotes','SELECT * FROM rate_quotes ORDER BY pair');}return out;}
 
 async function handleWebAdmin(req:Request,env:Env,url:URL):Promise<Response|null>{
   if(!url.pathname.startsWith('/admin-web'))return null;
