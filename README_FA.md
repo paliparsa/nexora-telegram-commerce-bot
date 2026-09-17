@@ -1,6 +1,6 @@
-# Nexora Commerce Bot v0.7.4
+# Nexora Commerce Bot v0.7.6
 
-> v0.7.4: منوی مرتب‌تر، Rate Engine چندمنبعی با fallback/cache، و فاکتور تست واقعی BEP20 در TEST Mode. راهنمای ارتقا: `UPGRADE_V074_FA.md`.
+> v0.7.6: BEP20 به RPC-first تغییر کرده، Contract به‌صورت on-chain بررسی می‌شود، و تست واقعی دیگر شرط اجباری LIVE نیست. راهنمای ارتقا: `UPGRADE_V076_FA.md`.
 
 # Nexora Commerce Bot — v0.7 Operations Suite
 
@@ -220,4 +220,4 @@ Deploy گیت/کلادفلر حالا با `wrangler deploy --keep-vars` انج�
 
 ## v0.7.3 — Payment diagnostics
 
-پنل پرداخت اکنون تست مستقل و تست یکجای BEP20، TRC20، TON، کارت‌به‌کارت و Rate Engine دارد. BEP20 ابتدا Etherscan API V2 را استفاده می‌کند و اگر provider در دسترس نباشد به BSC RPC fallback می‌رود. متغیر اختیاری `BSC_RPC_URL` برای تغییر RPC قابل استفاده است.
+پنل پرداخت اکنون تست مستقل و تست یکجای BEP20، TRC20، TON، کارت‌به‌کارت و Rate Engine دارد. BEP20 ابتدا BSC RPC را استفاده می‌کند و Etherscan فقط fallback/diagnostic است. تست BEP20 همچنین وجود Contract، `symbol()` و `decimals()` را مستقیماً روی زنجیره بررسی می‌کند. متغیر اختیاری `BSC_RPC_URL` برای تغییر RPC قابل استفاده است.

@@ -44,7 +44,7 @@ function randomHex(bytes=12){const a=new Uint8Array(bytes);crypto.getRandomValue
 const publicId=(p:string)=>`${p}${randomHex(10).toUpperCase()}`;
 function secureRandomInt(maxExclusive:number){const a=new Uint32Array(1);crypto.getRandomValues(a);return a[0]%maxExclusive;}
 const BSC_MAINNET_CHAIN_ID='56';
-const BSC_USDT_CONTRACT='0x55d398326f99059fF775485246999027B3197955';
+const BSC_USDT_CONTRACT='0x55d398326f99059fF775485246999027B3197955'; // recommended Binance-Peg USDT contract on BSC
 const TRON_USDT_CONTRACT='TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
 const DEFAULT_BSC_RPC='https://bsc-dataseed.binance.org/';
 const ERC20_TRANSFER_TOPIC='0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
@@ -213,7 +213,7 @@ async function rewardReferral(env:Env,invitee:number,reason:'join'|'first_purcha
 async function getRate(env:Env,pair:string){const p=pair.toUpperCase();const q:any=await env.DB.prepare('SELECT * FROM rate_quotes WHERE pair=?').bind(p).first();return q?Number(q.rate||0):0;}
 async function setRateQuote(env:Env,pair:string,rate:number,source:string,mode='auto'){if(!Number.isFinite(rate)||rate<=0)return;await env.DB.prepare("INSERT INTO rate_quotes(pair,rate,source,mode,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(pair) DO UPDATE SET rate=excluded.rate,source=excluded.source,mode=excluded.mode,updated_at=CURRENT_TIMESTAMP").bind(pair.toUpperCase(),rate,source,mode).run();}
 async function refreshRates(env:Env,force=false){
-  const ton=await refreshTonRate(env,force);if(ton)await setRateQuote(env,'TONUSD',ton,'CoinGecko','auto');
+  const ton=await refreshTonRate(env,force);if(ton){const src=await getSetting(env,'ton_usd_rate_source','auto');await setRateQuote(env,'TONUSD',ton,src||'auto','auto');}
   const mode=(await getSetting(env,'rate_usd_try_mode','auto')).toLowerCase();if(mode==='auto'){try{const r=await fetch('https://api.frankfurter.app/latest?from=USD&to=TRY',{headers:{accept:'application/json'}});if(r.ok){const d:any=await r.json();const v=Number(d?.rates?.TRY||0);if(v>0)await setRateQuote(env,'USDTRY',v,'Frankfurter','auto');}}catch{}}
   const irrMode=(await getSetting(env,'rate_usd_irr_mode','manual')).toLowerCase();if(irrMode==='manual'){const v=Number(await getSetting(env,'rate_usd_irr_manual','0'));if(v>0)await setRateQuote(env,'USDIRR',v,'manual','manual');}
   const tryMode=(await getSetting(env,'rate_usd_try_mode','auto')).toLowerCase();if(tryMode==='manual'){const v=Number(await getSetting(env,'rate_usd_try_manual','0'));if(v>0)await setRateQuote(env,'USDTRY',v,'manual','manual');}
@@ -223,10 +223,11 @@ async function fetchTonRateSource(url:string,extract:(d:any)=>number,headers:any
   catch(e:any){return {ok:false,rate:0,status:0,message:String(e?.message||e).slice(0,120)};}
 }
 async function tonRateProviders(){
-  const cg=await fetchTonRateSource('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',d=>Number(d?.['the-open-network']?.usd||0),{'accept':'application/json','user-agent':'Nexora-Commerce-Bot/0.7.4'});if(cg.ok)return {rate:cg.rate,source:'CoinGecko',details:`CoinGecko ${cg.rate}`};
+  const cg=await fetchTonRateSource('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',d=>Number(d?.['the-open-network']?.usd||0),{'accept':'application/json','user-agent':'Nexora-Commerce-Bot/0.7.6'});if(cg.ok)return {rate:cg.rate,source:'CoinGecko',details:`CoinGecko ${cg.rate}`};
+  const kr=await fetchTonRateSource('https://api.kraken.com/0/public/Ticker?pair=TONUSD',d=>{const r=d?.result||{};const first=Object.values(r)[0] as any;return Number(first?.c?.[0]||0)});if(kr.ok)return {rate:kr.rate,source:'Kraken',details:`Kraken ${kr.rate}`};
   const bn=await fetchTonRateSource('https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT',d=>Number(d?.price||0));if(bn.ok)return {rate:bn.rate,source:'Binance',details:`Binance ${bn.rate}`};
   const bn2=await fetchTonRateSource('https://api.binance.com/api/v3/avgPrice?symbol=TONUSDT',d=>Number(d?.price||0));if(bn2.ok)return {rate:bn2.rate,source:'BinanceAvg',details:`BinanceAvg ${bn2.rate}`};
-  return {rate:0,source:'',details:`CoinGecko ${cg.message}; Binance ${bn.message}; BinanceAvg ${bn2.message}`};
+  return {rate:0,source:'',details:`CoinGecko ${cg.message}; Kraken ${kr.message}; Binance ${bn.message}; BinanceAvg ${bn2.message}`};
 }
 async function refreshTonRate(env:Env,force=false){
   const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase();
@@ -255,14 +256,16 @@ async function bep20Status(env:Env){
   const wallet=await getSetting(env,'wallet_bep20',env.USDT_BEP20_WALLET||'');
   const token=bep20Token(env),chain=String(env.ETHERSCAN_CHAIN_ID||BSC_MAINNET_CHAIN_ID).trim();
   const testMode=await featureEnabled(env,'bep20_test_mode',true);
+  const liveVerified=await featureEnabled(env,'bep20_live_verified',false);
   const enabled=await featureEnabled(env,'feature_bep20',true);
   const walletOk=/^0x[a-fA-F0-9]{40}$/.test(wallet);
-  const tokenOk=normEvm(token)===normEvm(BSC_USDT_CONTRACT);
+  const tokenOk=/^0x[a-fA-F0-9]{40}$/.test(token);
+  const recommendedToken=normEvm(token)===normEvm(BSC_USDT_CONTRACT);
   const chainOk=chain===BSC_MAINNET_CHAIN_ID;
   const apiOk=!!env.ETHERSCAN_API_KEY;
   const rpcUrl=String(env.BSC_RPC_URL||DEFAULT_BSC_RPC).trim();
   const rpcOk=/^https:\/\//i.test(rpcUrl);
-  return {wallet,token,chain,testMode,enabled,walletOk,tokenOk,chainOk,apiOk,rpcUrl,rpcOk,ready:enabled&&walletOk&&tokenOk&&chainOk&&rpcOk};
+  return {wallet,token,chain,testMode,liveVerified,enabled,walletOk,tokenOk,recommendedToken,chainOk,apiOk,rpcUrl,rpcOk,ready:enabled&&walletOk&&tokenOk&&chainOk&&rpcOk};
 }
 async function paymentConfig(env:Env){
   return {
@@ -357,33 +360,68 @@ async function bscRpcCheck(env:Env):Promise<ProviderCheck>{
   try{const x=await bscRpcCall(env,'eth_blockNumber',[]);const ok=/^0x[0-9a-f]+$/i.test(String(x||''));return {ok,message:ok?`BSC RPC آنلاین — block ${parseInt(String(x),16)}`:`پاسخ نامعتبر: ${String(x).slice(0,160)}`};}
   catch(e:any){return {ok:false,message:String(e?.message||e).slice(0,220)};}
 }
+
+function decodeAbiString(hex:string){
+  const h=String(hex||'').replace(/^0x/,'');if(!h)return '';
+  try{
+    if(h.length===64){const b=new Uint8Array(h.match(/../g)!.map(x=>parseInt(x,16)));return new TextDecoder().decode(b).replace(/\0+$/g,'').trim();}
+    if(h.length>=128){const off=Number(BigInt('0x'+h.slice(0,64)))*2;if(off+64<=h.length){const len=Number(BigInt('0x'+h.slice(off,off+64)));const data=h.slice(off+64,off+64+len*2);const b=new Uint8Array((data.match(/../g)||[]).map(x=>parseInt(x,16)));return new TextDecoder().decode(b).replace(/\0+$/g,'').trim();}}
+  }catch{}return '';
+}
+async function bep20ContractInfo(env:Env):Promise<{ok:boolean;exists:boolean;symbol:string;decimals:number;chainId:string;recommended:boolean;message:string}>{
+  const token=bep20Token(env);
+  if(!/^0x[a-fA-F0-9]{40}$/.test(token))return {ok:false,exists:false,symbol:'',decimals:-1,chainId:'',recommended:false,message:'Contract address format invalid'};
+  try{
+    const [chainHex,code,symbolRaw,decRaw]=await Promise.all([
+      bscRpcCall(env,'eth_chainId',[]),
+      bscRpcCall(env,'eth_getCode',[token,'latest']),
+      bscRpcCall(env,'eth_call',[{to:token,data:'0x95d89b41'},'latest']),
+      bscRpcCall(env,'eth_call',[{to:token,data:'0x313ce567'},'latest'])
+    ]);
+    const chainId=String(parseInt(String(chainHex||'0x0'),16));
+    const exists=typeof code==='string'&&code!=='0x'&&code!=='0x0';
+    const symbol=decodeAbiString(String(symbolRaw||''));
+    let decimals=-1;try{decimals=Number(BigInt(String(decRaw||'0x0')));}catch{}
+    const recommended=normEvm(token)===normEvm(BSC_USDT_CONTRACT);
+    const ok=exists&&chainId===BSC_MAINNET_CHAIN_ID&&symbol.toUpperCase()==='USDT'&&Number.isInteger(decimals)&&decimals>=0&&decimals<=30;
+    const message=!exists?'Contract code not found':chainId!==BSC_MAINNET_CHAIN_ID?`RPC chainId=${chainId}, expected 56`:symbol.toUpperCase()!=='USDT'?`symbol=${symbol||'unknown'} (expected USDT)`:!(Number.isInteger(decimals)&&decimals>=0&&decimals<=30)?`invalid decimals=${decimals}`:`symbol=${symbol}, decimals=${decimals}${recommended?' — recommended contract':' — custom contract'}`;
+    return {ok,exists,symbol,decimals,chainId,recommended,message};
+  }catch(e:any){return {ok:false,exists:false,symbol:'',decimals:-1,chainId:'',recommended:normEvm(token)===normEvm(BSC_USDT_CONTRACT),message:String(e?.message||e).slice(0,220)};}
+}
 async function fetchBep20Etherscan(env:Env,wallet:string):Promise<{ok:boolean;items:ChainTransfer[];message:string}>{
   if(!env.ETHERSCAN_API_KEY)return {ok:false,items:[],message:'missing api key'};
   const u=new URL('https://api.etherscan.io/v2/api');u.searchParams.set('chainid',BSC_MAINNET_CHAIN_ID);u.searchParams.set('module','account');u.searchParams.set('action','tokentx');
-  u.searchParams.set('contractaddress',BSC_USDT_CONTRACT);u.searchParams.set('address',wallet);u.searchParams.set('page','1');u.searchParams.set('offset','150');u.searchParams.set('sort','desc');u.searchParams.set('apikey',String(env.ETHERSCAN_API_KEY));
+  const token=bep20Token(env);u.searchParams.set('contractaddress',token);u.searchParams.set('address',wallet);u.searchParams.set('page','1');u.searchParams.set('offset','150');u.searchParams.set('sort','desc');u.searchParams.set('apikey',String(env.ETHERSCAN_API_KEY));
   try{
     const r=await fetch(u.toString(),{headers:{accept:'application/json'}});const raw=await r.text();let d:any=null;try{d=JSON.parse(raw)}catch{}
     const arr=Array.isArray(d?.result)?d.result:[];const text=String(d?.result||d?.message||raw||'');
     const noTx=/no transactions found/i.test(text)||(/NOTOK/i.test(String(d?.message||''))&&Array.isArray(d?.result)&&d.result.length===0);
     const ok=r.ok&&(String(d?.status)==='1'||Array.isArray(d?.result)||noTx);
     if(!ok)return {ok:false,items:[],message:(String(d?.result||d?.message||raw||`HTTP ${r.status}`)).slice(0,220)};
-    const items=arr.filter((x:any)=>normEvm(String(x.contractAddress||''))===normEvm(BSC_USDT_CONTRACT)&&normEvm(String(x.to||''))===normEvm(wallet)&&String(x.isError||'0')!=='1'&&Number(x.blockNumber||0)>0).map((x:any)=>({hash:String(x.hash||''),from:String(x.from||''),to:String(x.to||''),amount:Number(x.value)/10**Number(x.tokenDecimal||18),ts:Number(x.timeStamp||0)*1000,ok:true,confirmations:Number(x.confirmations||0),contract:String(x.contractAddress||''),blockNumber:Number(x.blockNumber||0)}));
+    const items=arr.filter((x:any)=>normEvm(String(x.contractAddress||''))===normEvm(token)&&normEvm(String(x.to||''))===normEvm(wallet)&&String(x.isError||'0')!=='1'&&Number(x.blockNumber||0)>0).map((x:any)=>({hash:String(x.hash||''),from:String(x.from||''),to:String(x.to||''),amount:Number(x.value)/10**Number(x.tokenDecimal||18),ts:Number(x.timeStamp||0)*1000,ok:true,confirmations:Number(x.confirmations||0),contract:String(x.contractAddress||''),blockNumber:Number(x.blockNumber||0)}));
     return {ok:true,items,message:items.length?`${items.length} transfer found`:'connected; no matching transfers'};
   }catch(e:any){return {ok:false,items:[],message:String(e?.message||e).slice(0,220)};}
 }
 async function fetchBep20Rpc(env:Env,wallet:string):Promise<ChainTransfer[]>{
+  const info=await bep20ContractInfo(env);if(!info.ok)throw new Error(`BEP20 contract validation failed: ${info.message}`);
+  const token=bep20Token(env),decimals=info.decimals;
   const latestHex=await bscRpcCall(env,'eth_blockNumber',[]);const latest=parseInt(String(latestHex),16);if(!Number.isFinite(latest))throw new Error('invalid latest block');
   const from=Math.max(0,latest-4500);const topicTo='0x'+wallet.toLowerCase().replace(/^0x/,'').padStart(64,'0');
-  const logs:any[]=await bscRpcCall(env,'eth_getLogs',[{fromBlock:'0x'+from.toString(16),toBlock:'latest',address:BSC_USDT_CONTRACT,topics:[ERC20_TRANSFER_TOPIC,null,topicTo]}])||[];
+  let logs:any[]=[];
+  try{logs=await bscRpcCall(env,'eth_getLogs',[{fromBlock:'0x'+from.toString(16),toBlock:'latest',address:token,topics:[ERC20_TRANSFER_TOPIC,null,topicTo]}])||[];}
+  catch{
+    const chunk=1500;for(let a=from;a<=latest;a+=chunk){const z=Math.min(latest,a+chunk-1);const part:any[]=await bscRpcCall(env,'eth_getLogs',[{fromBlock:'0x'+a.toString(16),toBlock:'0x'+z.toString(16),address:token,topics:[ERC20_TRANSFER_TOPIC,null,topicTo]}])||[];logs.push(...part);}
+  }
   const selected=logs.slice(-150).reverse();const blocks=new Map<number,number>();
   for(const l of selected){const bn=parseInt(String(l.blockNumber||'0x0'),16);if(bn&&!blocks.has(bn)){try{const b=await bscRpcCall(env,'eth_getBlockByNumber',['0x'+bn.toString(16),false]);blocks.set(bn,parseInt(String(b?.timestamp||'0x0'),16)*1000);}catch{blocks.set(bn,0);}}}
-  return selected.map((l:any)=>{const bn=parseInt(String(l.blockNumber||'0x0'),16);let amount=0;try{amount=Number(BigInt(String(l.data||'0x0')))/1e18}catch{}return {hash:String(l.transactionHash||''),from:'',to:wallet,amount,ts:blocks.get(bn)||0,ok:true,confirmations:Math.max(0,latest-bn+1),contract:BSC_USDT_CONTRACT,blockNumber:bn};});
+  const divisor=10**decimals;
+  return selected.map((l:any)=>{const bn=parseInt(String(l.blockNumber||'0x0'),16);let amount=0;try{amount=Number(BigInt(String(l.data||'0x0')))/divisor}catch{}return {hash:String(l.transactionHash||''),from:'',to:wallet,amount,ts:blocks.get(bn)||0,ok:true,confirmations:Math.max(0,latest-bn+1),contract:token,blockNumber:bn};});
 }
 async function fetchBep20Transfers(env:Env,wallet:string):Promise<ChainTransfer[]>{
   const st=await bep20Status(env);if(!st.ready||normEvm(wallet)!==normEvm(st.wallet))return [];
+  try{return await fetchBep20Rpc(env,wallet);}catch(e){console.log('BSC RPC scanner unavailable, using Etherscan fallback:',String(e));}
   const es=await fetchBep20Etherscan(env,wallet);if(es.ok)return es.items;
-  console.log('Etherscan BSC scanner unavailable, using RPC fallback:',es.message);
-  try{return await fetchBep20Rpc(env,wallet);}catch(e){console.log('BSC RPC fallback failed',String(e));return []}
+  console.log('Etherscan BSC fallback failed:',es.message);return [];
 }
 async function fetchTrc20Transfers(env:Env,wallet:string):Promise<ChainTransfer[]>{
   if(!wallet||!env.USDT_TRC20_TOKEN)return [];
@@ -405,15 +443,18 @@ type MethodDiagnostic={name:string;ok:boolean;lines:string[]};
 function okMark(v:boolean){return v?'✅':'❌';}
 function maskSecret(v?:string){if(!v)return 'ندارد';return v.length<=8?'••••':`${v.slice(0,4)}…${v.slice(-4)}`;}
 async function diagnoseBep20(env:Env):Promise<MethodDiagnostic>{
-  const b=await bep20Status(env);const es=await etherscanBscCheck(env,b.wallet);const rpc=await bscRpcCheck(env);const providerOk=es.ok||rpc.ok;
-  return {name:'BEP20 / BSC',ok:b.walletOk&&b.tokenOk&&b.chainOk&&providerOk,lines:[
+  const b=await bep20Status(env);const rpc=await bscRpcCheck(env);const ci=await bep20ContractInfo(env);const es=await etherscanBscCheck(env,b.wallet);const providerOk=rpc.ok||es.ok;
+  return {name:'BEP20 / BSC',ok:b.walletOk&&b.tokenOk&&b.chainOk&&providerOk&&ci.ok,lines:[
     `${okMark(b.walletOk)} Wallet: ${b.walletOk?'معتبر':'نامعتبر/تنظیم نشده'}`,
-    `${okMark(b.tokenOk)} USDT contract whitelist: ${b.tokenOk?'صحیح':'اشتباه'}`,
-    `${okMark(b.chainOk)} Chain ID: ${b.chain||'—'} ${b.chainOk?'':'(باید 56 باشد)'}`,
-    `${es.ok?'✅':'⚠️'} Etherscan V2: ${es.message}`,
-    `${rpc.ok?'✅':'❌'} BSC RPC fallback: ${rpc.message}`,
+    `${okMark(b.tokenOk)} Contract format: ${b.tokenOk?'معتبر':'نامعتبر'}`,
+    `${ci.ok?'✅':'❌'} Contract on-chain: ${ci.message}`,
+    `${ci.recommended?'✅':'⚠️'} Contract source: ${ci.recommended?'آدرس پیشنهادی پروژه':'آدرس سفارشی — مسئولیت انتخاب با ادمین'}`,
+    `${okMark(b.chainOk)} Config Chain ID: ${b.chain||'—'} ${b.chainOk?'':'(باید 56 باشد)'}`,
+    `${rpc.ok?'✅':'❌'} BSC RPC (primary): ${rpc.message}`,
+    `${es.ok?'✅':'⚠️'} Etherscan V2 (fallback/diagnostic): ${es.message}`,
     `🔑 Etherscan key: ${maskSecret(env.ETHERSCAN_API_KEY)}`,
-    `🧪 Mode: ${b.testMode?'TEST':'LIVE'}`
+    `🧪 Mode: ${b.testMode?'TEST':'LIVE'}`,
+    `🧾 Real-payment test: ${b.liveVerified?'✅ قبلاً موفق بوده':'⚠️ انجام نشده — فقط هشدار، LIVE قفل نیست'}`
   ]};
 }
 async function diagnoseTrc20(env:Env):Promise<MethodDiagnostic>{
@@ -448,7 +489,7 @@ function sameDest(network:string,a:string,b:string){if(network==='TON')return tr
 async function settleCrypto(env:Env,invoice:any,tx:ChainTransfer){
   const txHash=String(tx.hash||'').toLowerCase(); if(!txHash||!tx.ok)return false;
   const reqConf=Number(await getSetting(env,`confirmations_${String(invoice.network).toLowerCase()}`,invoice.network==='BEP20'?'5':'1'))||1;if((tx.confirmations??0)<reqConf)return false;
-  if(String(invoice.network)==='BEP20'){const bs=await bep20Status(env);if(!bs.ready||bs.testMode||normEvm(String(tx.contract||''))!==normEvm(BSC_USDT_CONTRACT)||!tx.blockNumber)return false;}
+  if(String(invoice.network)==='BEP20'){const bs=await bep20Status(env);if(!bs.ready||bs.testMode||normEvm(String(tx.contract||''))!==normEvm(bs.token)||!tx.blockNumber)return false;}
   if(!sameDest(String(invoice.network),String(tx.to||''),String(invoice.destination||'')))return false;
   if(Math.abs(Number(tx.amount)-Number(invoice.expected_amount))>(invoice.network==='TON'?0.00000001:0.0000001))return false;
   const created=Date.parse(invoice.created_at||'')||0; if(tx.ts&&created&&tx.ts<created)return false;
@@ -492,7 +533,7 @@ async function scanPendingCrypto(env:Env,onlyPublicId?:string,ownerTelegramId?:n
     for(const inv of invs){const created=Date.parse(inv.created_at||'')||0;const expected=Number(inv.expected_amount||0);const nearPct=Math.max(0.1,Number(await getSetting(env,'payment_near_match_percent','2'))||2)/100;const nearAbs=Math.max(inv.network==='TON'?0.002:0.02,Math.abs(expected)*nearPct);const reqConf=Number(await getSetting(env,`confirmations_${String(inv.network).toLowerCase()}`,inv.network==='BEP20'?'5':'1'))||1;
       for(const tx of txs){if(!tx.ok||!sameDest(String(inv.network),String(tx.to||''),String(inv.destination||'')))continue;if(created&&tx.ts&&tx.ts<created)continue;const hash=String(tx.hash||'').toLowerCase();if(!hash)continue;if(await isBlacklisted(env,'txid',hash)||await isBlacklisted(env,'wallet',String(tx.from||''))){try{await env.DB.prepare("INSERT OR IGNORE INTO payment_events(invoice_id,public_id,telegram_id,event_type,network,tx_hash,expected_amount,detected_amount,confirmations,details) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(inv.id,inv.public_id,inv.telegram_id,'blacklisted_payment',inv.network,hash,expected,tx.amount,tx.confirmations||0,`source=${tx.from||''}`).run();}catch{}await notifyAdmins(env,'payment_issue',`🚫 <b>پرداخت Blacklist شده</b>\n\n🧾 <code>${inv.public_id}</code>\n🔗 <code>${hash}</code>\nFrom: <code>${esc(String(tx.from||'unknown'))}</code>`,inv.public_id);continue;}const used:any=await env.DB.prepare("SELECT 1 x FROM payment_settlements WHERE tx_hash=? UNION SELECT 1 x FROM payment_events WHERE tx_hash=? AND event_type IN ('late_payment','underpayment','overpayment') LIMIT 1").bind(hash,hash).first();if(used)continue;const diff=Number(tx.amount)-expected;const exact=Math.abs(diff)<=(inv.network==='TON'?0.00000001:0.0000001);
         if(exact&&Number(tx.confirmations||0)<reqConf){try{await env.DB.prepare("INSERT OR IGNORE INTO payment_events(invoice_id,public_id,telegram_id,event_type,network,tx_hash,expected_amount,detected_amount,confirmations,details) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(inv.id,inv.public_id,inv.telegram_id,'awaiting_confirmations',inv.network,hash,expected,tx.amount,tx.confirmations||0,`need ${reqConf}`).run();}catch{}continue;}
-        if(exact&&inv.network==='BEP20'&&(await bep20Status(env)).testMode){try{await env.DB.prepare("INSERT OR IGNORE INTO payment_events(invoice_id,public_id,telegram_id,event_type,network,tx_hash,expected_amount,detected_amount,confirmations,details) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(inv.id,inv.public_id,inv.telegram_id,'bep20_test_detected',inv.network,hash,expected,tx.amount,tx.confirmations||0,'BEP20 test mode: detected but not credited').run();}catch{}await notifyAdmins(env,'payment_issue',`🧪 <b>تست BEP20 موفق بود</b>\n\n🧾 <code>${inv.public_id}</code>\n✅ Contract whitelist صحیح\n✅ مقصد صحیح\n✅ مبلغ صحیح\n✅ Confirmations: ${Number(tx.confirmations||0)}\n🔗 <code>${hash}</code>\n\nبرای پرداخت واقعی، BEP20 را از حالت تست خارج کن.`,inv.public_id);break;}
+        if(exact&&inv.network==='BEP20'&&(await bep20Status(env)).testMode){try{await env.DB.batch([env.DB.prepare("INSERT OR IGNORE INTO payment_events(invoice_id,public_id,telegram_id,event_type,network,tx_hash,expected_amount,detected_amount,confirmations,details) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(inv.id,inv.public_id,inv.telegram_id,'bep20_test_detected',inv.network,hash,expected,tx.amount,tx.confirmations||0,'BEP20 test mode: detected but not credited'),env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('bep20_live_verified','1') ON CONFLICT(key) DO UPDATE SET value='1'")]);}catch{}await notifyAdmins(env,'payment_issue',`🧪 <b>تست BEP20 موفق بود</b>\n\n🧾 <code>${inv.public_id}</code>\n✅ Contract whitelist صحیح\n✅ مقصد صحیح\n✅ مبلغ صحیح\n✅ Confirmations: ${Number(tx.confirmations||0)}\n🔗 <code>${hash}</code>\n\nبرای پرداخت واقعی، BEP20 را از حالت تست خارج کن.`,inv.public_id);break;}
         if(exact&&inv.status==='pending'&&new Date(inv.expires_at||0).getTime()>Date.now()){if(await settleCrypto(env,inv,tx)){n++;break;}}
         else if(exact){if(await markPaymentIssue(env,inv,tx,'late_payment'))break;}
         else if(Math.abs(diff)<=nearAbs){if(await markPaymentIssue(env,inv,tx,diff<0?'underpayment':'overpayment'))break;}
@@ -804,9 +845,7 @@ async function adminPayments(env:Env,chat:number,mid:number){
 🏦 <code>${esc(c.card||'تنظیم نشده')}</code>
 👤 <b>${esc(c.cardHolder||'—')}</b>`;
   await edit(env,chat,mid,t,[
-    [{text:'🧪 تست همه روش‌ها',callback_data:'admin:paytest:all'}],
-    [{text:'🟡 BEP20',callback_data:'admin:paytest:bep20'},{text:'🔴 TRC20',callback_data:'admin:paytest:trc20'},{text:'💎 TON',callback_data:'admin:paytest:ton'}],
-    [{text:'🏦 کارت',callback_data:'admin:paytest:card'},{text:'📈 Rate Engine',callback_data:'admin:paytest:rates'}],
+    [{text:'🧪 مرکز تست پرداخت',callback_data:'admin:paytests'}],
     [{text:'🟡 آدرس BEP20',callback_data:'admin:payset:wallet_bep20'},{text:'🔴 آدرس TRC20',callback_data:'admin:payset:wallet_trc20'}],
     [{text:'💎 آدرس TON',callback_data:'admin:payset:wallet_ton'},{text:'🏦 شماره کارت',callback_data:'admin:payset:card_number'}],
     [{text:b.testMode?'🧪 BEP20: TEST':'🟢 BEP20: LIVE',callback_data:'admin:bep20:mode'},{text:b.enabled?'⏸ خاموش BEP20':'▶️ روشن BEP20',callback_data:'admin:bep20:toggle'}],
@@ -815,6 +854,11 @@ async function adminPayments(env:Env,chat:number,mid:number){
     [{text:'✍️ نرخ دستی TON',callback_data:'admin:payset:ton_usd_rate'},{text:'👤 صاحب کارت',callback_data:'admin:payset:card_holder'}],
     [{text:'⬅️ مالی و پرداخت',callback_data:'admin:section:finance'}]
   ]);
+}
+async function adminPaymentTests(env:Env,chat:number,mid:number){
+  const b=await bep20Status(env);
+  const warning=!b.liveVerified?'\n\n⚠️ تست واقعی BEP20 هنوز انجام نشده؛ این فقط هشدار است و ادمین می‌تواند LIVE را فعال کند.':'';
+  await edit(env,chat,mid,`🧪 <b>مرکز تست پرداخت</b>\n\nاز این بخش وضعیت واقعی Providerها و تنظیمات هر روش را بررسی کن.${warning}`,[[{text:'✅ تست همه روش‌ها',callback_data:'admin:paytest:all'}],[{text:'🟡 BEP20',callback_data:'admin:paytest:bep20'},{text:'🔴 TRC20',callback_data:'admin:paytest:trc20'}],[{text:'💎 TON',callback_data:'admin:paytest:ton'},{text:'🏦 کارت',callback_data:'admin:paytest:card'}],[{text:'📈 Rate Engine',callback_data:'admin:paytest:rates'}],...(b.testMode?[[{text:'💸 فاکتور تست واقعی BEP20',callback_data:'admin:bep20:testinvoice'}]]:[]),[{text:'⬅️ تنظیمات پرداخت',callback_data:'admin:payments'}]]);
 }
 async function adminOrders(env:Env,chat:number,mid:number){
   const q:any=await env.DB.prepare("SELECT o.*,p.title FROM orders o JOIN products p ON p.id=o.product_id ORDER BY o.id DESC LIMIT 20").all();
@@ -1071,6 +1115,7 @@ async function handleCallback(env:Env,c:CallbackQuery){
   if(d==='admin:channels')return adminChannels(env,chat,mid);
   if(d==='admin:discounts')return adminDiscounts(env,chat,mid);
   if(d==='admin:payments')return adminPayments(env,chat,mid);
+  if(d==='admin:paytests')return adminPaymentTests(env,chat,mid);
   if(d==='admin:orders')return adminOrders(env,chat,mid);
   if(d.startsWith('admin:order:refund:')){const id=Number(d.split(':')[3]);const o=await refundOrder(env,uid,id);if(!o)return answerCb(env,c.id,'این سفارش قابل Refund نیست.',true);await answerCb(env,c.id,'Refund انجام شد ✅',true);return adminOrderDetail(env,chat,mid,id);}
   if(d.startsWith('admin:order:'))return adminOrderDetail(env,chat,mid,Number(d.split(':')[2]));
@@ -1185,11 +1230,11 @@ async function adminUsersHtml(env:Env,url:URL){
   return `${detailHtml}<div class="card" style="margin-top:14px"><form method="get" action="/admin-web"><input type="hidden" name="tab" value="users"><div class="row"><div><input name="q" value="${webEsc(q)}" placeholder="ID، username یا نام"></div><div><button class="btn">جستجو</button></div></div></form><table><tr><th>ID</th><th>نام</th><th>Username</th><th>موجودی</th><th>عضویت</th><th></th></tr>${(r.results||[]).map((u:any)=>`<tr><td class="ltr">${u.telegram_id}</td><td>${webEsc(u.first_name||'')}</td><td>${u.username?'@'+webEsc(u.username):'—'}</td><td>${Number(u.balance||0).toFixed(2)}</td><td>${u.join_verified?'✅':'—'}</td><td><a class="btn" href="/admin-web?tab=users&id=${u.telegram_id}">باز کردن</a></td></tr>`).join('')}</table></div>`;
 }
 async function adminOrdersHtml(env:Env){const r:any=await env.DB.prepare("SELECT o.*,p.title FROM orders o JOIN products p ON p.id=o.product_id ORDER BY o.id DESC LIMIT 100").all();return `<div class="card"><h3>آخرین سفارش‌ها</h3><table><tr><th>سفارش</th><th>کاربر</th><th>محصول</th><th>فروش</th><th>هزینه</th><th>سود</th><th>وضعیت</th></tr>${(r.results||[]).map((o:any)=>`<tr><td>${webEsc(o.public_id)}</td><td class="ltr">${o.telegram_id}</td><td>${webEsc(o.title)} × ${o.quantity}</td><td>${Number(o.total_price).toFixed(2)}</td><td>${Number(o.cost_total||0).toFixed(2)}</td><td>${(Number(o.total_price)-Number(o.cost_total||0)).toFixed(2)}</td><td>${webEsc(o.status)}</td></tr>`).join('')}</table></div>`;}
-async function adminPaymentsHtml(env:Env,url?:URL){await refreshRates(env);const cfg=await paymentConfig(env);const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase();const auto=await getSetting(env,'ton_usd_rate_auto','0');const upd=await getSetting(env,'ton_usd_rate_updated_at','');const b=await bep20Status(env);const test=String(url?.searchParams.get('test')||'');let diag='';if(['all','bep20','trc20','ton','card','rates'].includes(test))diag=diagnosticsHtml(await paymentDiagnostics(env,test));return `<div class="card"><h3>BEP20 / USDT روی BSC</h3><p>وضعیت: <b>${!b.enabled?'غیرفعال':!b.ready?'تنظیم ناقص':b.testMode?'حالت تست':'فعال واقعی'}</b></p><p>Wallet: <span class="ltr">${webEsc(b.wallet||'—')}</span></p><p>Contract whitelist: <span class="ltr">${BSC_USDT_CONTRACT}</span></p><p>Chain ID: <b>56</b> | Confirmations: <b>${webEsc(await getSetting(env,'confirmations_bep20','5'))}</b></p><p class="muted">Etherscan V2 در اولویت است و اگر در دسترس نباشد Scanner به BSC RPC fallback می‌رود.</p><form method="post" action="/admin-web"><input type="hidden" name="action" value="bep20_mode_toggle"><button class="btn ${b.testMode?'good':'warn'}">${b.testMode?'فعال‌کردن حالت واقعی':'برگشت به حالت تست'}</button></form><form method="post" action="/admin-web" style="margin-top:8px"><input type="hidden" name="action" value="bep20_feature_toggle"><button class="btn">${b.enabled?'غیرفعال‌کردن BEP20':'فعال‌کردن BEP20'}</button></form><div class="actions" style="margin-top:12px"><a class="btn good" href="/admin-web?tab=payments&test=all">🧪 تست همه روش‌ها</a><a class="btn" href="/admin-web?tab=payments&test=bep20">BEP20</a><a class="btn" href="/admin-web?tab=payments&test=trc20">TRC20</a><a class="btn" href="/admin-web?tab=payments&test=ton">TON</a><a class="btn" href="/admin-web?tab=payments&test=card">کارت</a><a class="btn" href="/admin-web?tab=payments&test=rates">Rates</a></div></div><div class="card" style="margin-top:14px"><h3>نرخ TON و پرداخت</h3><p>نرخ موثر فعلی: <b>$${Number(cfg.tonRate||0).toFixed(4)}</b></p><p class="muted">نرخ خودکار ذخیره‌شده: $${Number(auto||0).toFixed(4)} ${upd?`— ${webEsc(upd)}`:''}</p><form method="post" action="/admin-web"><input type="hidden" name="action" value="ton_rate_save"><div class="row"><div class="field"><label>حالت نرخ</label><select name="mode"><option value="auto" ${mode==='auto'?'selected':''}>خودکار (CoinGecko)</option><option value="manual" ${mode==='manual'?'selected':''}>دستی</option></select></div><div class="field"><label>نرخ دستی TON/USD</label><input type="number" step="0.0001" min="0" name="manual_rate" value="${webEsc(await getSetting(env,'ton_usd_rate',env.TON_USD_RATE||''))}"></div></div><button class="btn primary">ذخیره</button></form><form method="post" action="/admin-web" style="margin-top:10px"><input type="hidden" name="action" value="ton_rate_refresh"><button class="btn good">🔄 دریافت فوری نرخ خودکار</button></form><hr style="border-color:#24314e;margin:18px 0"><p>USD/TRY: <b>${(await getRate(env,'USDTRY'))||'—'}</b> | USD/IRR: <b>${(await getRate(env,'USDIRR'))||'—'}</b></p><p>🟡 BEP20: <span class="ltr">${webEsc(cfg.bep20||'غیرفعال')}</span></p><p>🔴 TRC20: <span class="ltr">${webEsc(cfg.trc20||'غیرفعال')}</span></p><p>💎 TON: <span class="ltr">${webEsc(cfg.ton||'غیرفعال')}</span></p><p>🏦 کارت: ${webEsc(cfg.card||'غیرفعال')} — ${webEsc(cfg.cardHolder||'')}</p></div>${diag}`;}
+async function adminPaymentsHtml(env:Env,url?:URL){await refreshRates(env);const cfg=await paymentConfig(env);const mode=(await getSetting(env,'ton_rate_mode','auto')).toLowerCase();const auto=await getSetting(env,'ton_usd_rate_auto','0');const upd=await getSetting(env,'ton_usd_rate_updated_at','');const b=await bep20Status(env);const test=String(url?.searchParams.get('test')||'');let diag='';if(['all','bep20','trc20','ton','card','rates'].includes(test))diag=diagnosticsHtml(await paymentDiagnostics(env,test));return `<div class="card"><h3>BEP20 / USDT روی BSC</h3><p>وضعیت: <b>${!b.enabled?'غیرفعال':!b.ready?'تنظیم ناقص':b.testMode?'حالت تست':'فعال واقعی'}</b></p><p>Wallet: <span class="ltr">${webEsc(b.wallet||'—')}</span></p><p>Contract whitelist: <span class="ltr">${webEsc(b.token)}</span></p><p class="muted">Recommended: <span class="ltr">${BSC_USDT_CONTRACT}</span>${b.recommendedToken?' ✅':' ⚠️ contract سفارشی'}</p><p>Chain ID: <b>56</b> | Confirmations: <b>${webEsc(await getSetting(env,'confirmations_bep20','5'))}</b></p><p class="muted">Scanner ابتدا BSC RPC را استفاده می‌کند و Etherscan فقط fallback/diagnostic است. Contract در تست با eth_getCode + symbol() + decimals() بررسی می‌شود.</p><form method="post" action="/admin-web"><input type="hidden" name="action" value="bep20_mode_toggle"><button class="btn ${b.testMode?'good':'warn'}">${b.testMode?'فعال‌کردن حالت واقعی':'برگشت به حالت تست'}</button>${!b.liveVerified?'<p class="muted">⚠️ تست واقعی هنوز انجام نشده؛ LIVE اختیاری است.</p>':''}</form><form method="post" action="/admin-web" style="margin-top:8px"><input type="hidden" name="action" value="bep20_feature_toggle"><button class="btn">${b.enabled?'غیرفعال‌کردن BEP20':'فعال‌کردن BEP20'}</button></form><div class="actions" style="margin-top:12px"><a class="btn good" href="/admin-web?tab=payments&test=all">🧪 تست همه روش‌ها</a><a class="btn" href="/admin-web?tab=payments&test=bep20">BEP20</a><a class="btn" href="/admin-web?tab=payments&test=trc20">TRC20</a><a class="btn" href="/admin-web?tab=payments&test=ton">TON</a><a class="btn" href="/admin-web?tab=payments&test=card">کارت</a><a class="btn" href="/admin-web?tab=payments&test=rates">Rates</a></div></div><div class="card" style="margin-top:14px"><h3>نرخ TON و پرداخت</h3><p>نرخ موثر فعلی: <b>$${Number(cfg.tonRate||0).toFixed(4)}</b></p><p class="muted">نرخ خودکار ذخیره‌شده: $${Number(auto||0).toFixed(4)} ${upd?`— ${webEsc(upd)}`:''}</p><form method="post" action="/admin-web"><input type="hidden" name="action" value="ton_rate_save"><div class="row"><div class="field"><label>حالت نرخ</label><select name="mode"><option value="auto" ${mode==='auto'?'selected':''}>خودکار (چند منبع)</option><option value="manual" ${mode==='manual'?'selected':''}>دستی</option></select></div><div class="field"><label>نرخ دستی TON/USD</label><input type="number" step="0.0001" min="0" name="manual_rate" value="${webEsc(await getSetting(env,'ton_usd_rate',env.TON_USD_RATE||''))}"></div></div><button class="btn primary">ذخیره</button></form><form method="post" action="/admin-web" style="margin-top:10px"><input type="hidden" name="action" value="ton_rate_refresh"><button class="btn good">🔄 دریافت فوری نرخ خودکار</button></form><hr style="border-color:#24314e;margin:18px 0"><p>USD/TRY: <b>${(await getRate(env,'USDTRY'))||'—'}</b> | USD/IRR: <b>${(await getRate(env,'USDIRR'))||'—'}</b></p><p>🟡 BEP20: <span class="ltr">${webEsc(cfg.bep20||'غیرفعال')}</span></p><p>🔴 TRC20: <span class="ltr">${webEsc(cfg.trc20||'غیرفعال')}</span></p><p>💎 TON: <span class="ltr">${webEsc(cfg.ton||'غیرفعال')}</span></p><p>🏦 کارت: ${webEsc(cfg.card||'غیرفعال')} — ${webEsc(cfg.cardHolder||'')}</p></div>${diag}`;}
 
 async function adminOperationsHtml(env:Env){const m=await maintenanceOn(env);const features=[['feature_shop','فروشگاه'],['feature_crypto','کریپتو'],['feature_card','کارت'],['feature_referral','Referral'],['feature_support','پشتیبانی'],['feature_broadcast','Broadcast']];let fs='';for(const [k,l] of features)fs+=`<tr><td>${webEsc(l)}</td><td>${await featureEnabled(env,k,true)?'🟢 فعال':'⚪ غیرفعال'}</td><td><form method="post" action="/admin-web"><input type="hidden" name="action" value="feature_toggle"><input type="hidden" name="key" value="${k}"><button class="btn">تغییر</button></form></td></tr>`;return `<div class="card"><h3>عملیات و Feature Flags</h3><p>حالت نگهداری: <b>${m?'🔴 فعال':'🟢 غیرفعال'}</b></p><form method="post" action="/admin-web"><input type="hidden" name="action" value="maintenance_toggle"><button class="btn ${m?'good':'bad'}">${m?'خاموش کردن':'فعال کردن'} نگهداری</button></form><table><tr><th>قابلیت</th><th>وضعیت</th><th></th></tr>${fs}</table></div>`;}
 function adminBackupHtml(){return `<div class="card"><h3>Backup / Export</h3><p class="muted">خروجی JSON از داده‌های اصلی. فایل‌ها فقط با Session معتبر ادمین قابل دریافت‌اند.</p><div class="actions"><a class="btn" href="/admin-web/export?type=users">Users</a><a class="btn" href="/admin-web/export?type=orders">Orders</a><a class="btn" href="/admin-web/export?type=ledger">Ledger</a><a class="btn" href="/admin-web/export?type=payments">Payments</a><a class="btn" href="/admin-web/export?type=settings">Settings</a><a class="btn good" href="/admin-web/export?type=all">Full Backup</a></div></div>`;}
-async function exportAdminData(env:Env,type:string){const allowed=new Set(['users','orders','ledger','payments','settings','all']);if(!allowed.has(type))type='all';const out:any={exported_at:nowIso(),version:'0.7.4'};const load=async(name:string,sql:string)=>{const r:any=await env.DB.prepare(sql).all();out[name]=r.results||[];};if(type==='users'||type==='all')await load('users','SELECT * FROM users ORDER BY id');if(type==='orders'||type==='all')await load('orders','SELECT * FROM orders ORDER BY id');if(type==='ledger'||type==='all')await load('ledger','SELECT * FROM credit_ledger ORDER BY id');if(type==='payments'||type==='all'){await load('payment_invoices','SELECT * FROM payment_invoices ORDER BY id');await load('payment_events','SELECT * FROM payment_events ORDER BY id');}if(type==='settings'||type==='all')await load('bot_settings','SELECT * FROM bot_settings ORDER BY key');if(type==='all'){await load('products','SELECT * FROM products ORDER BY id');await load('categories','SELECT * FROM shop_categories ORDER BY id');await load('referrals','SELECT * FROM referrals ORDER BY id');await load('support_tickets','SELECT * FROM support_tickets ORDER BY id');await load('admin_logs','SELECT * FROM admin_logs ORDER BY id');await load('risk_blacklist','SELECT * FROM risk_blacklist ORDER BY id');await load('rate_quotes','SELECT * FROM rate_quotes ORDER BY pair');}return out;}
+async function exportAdminData(env:Env,type:string){const allowed=new Set(['users','orders','ledger','payments','settings','all']);if(!allowed.has(type))type='all';const out:any={exported_at:nowIso(),version:'0.7.6'};const load=async(name:string,sql:string)=>{const r:any=await env.DB.prepare(sql).all();out[name]=r.results||[];};if(type==='users'||type==='all')await load('users','SELECT * FROM users ORDER BY id');if(type==='orders'||type==='all')await load('orders','SELECT * FROM orders ORDER BY id');if(type==='ledger'||type==='all')await load('ledger','SELECT * FROM credit_ledger ORDER BY id');if(type==='payments'||type==='all'){await load('payment_invoices','SELECT * FROM payment_invoices ORDER BY id');await load('payment_events','SELECT * FROM payment_events ORDER BY id');}if(type==='settings'||type==='all')await load('bot_settings','SELECT * FROM bot_settings ORDER BY key');if(type==='all'){await load('products','SELECT * FROM products ORDER BY id');await load('categories','SELECT * FROM shop_categories ORDER BY id');await load('referrals','SELECT * FROM referrals ORDER BY id');await load('support_tickets','SELECT * FROM support_tickets ORDER BY id');await load('admin_logs','SELECT * FROM admin_logs ORDER BY id');await load('risk_blacklist','SELECT * FROM risk_blacklist ORDER BY id');await load('rate_quotes','SELECT * FROM rate_quotes ORDER BY pair');}return out;}
 
 async function handleWebAdmin(req:Request,env:Env,url:URL):Promise<Response|null>{
   if(!url.pathname.startsWith('/admin-web'))return null;
