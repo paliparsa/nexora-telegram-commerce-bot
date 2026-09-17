@@ -915,7 +915,37 @@ async function handleCallback(env:Env,c:CallbackQuery){
   if(d==='admin:scan'){const n=await scanPendingCrypto(env); await logAdmin(env,uid,'crypto_scan',undefined,undefined,`settled=${n}`);return answerCb(env,c.id,`${n} پرداخت جدید تأیید شد.`,true);}
   if(d==='admin:bep20:mode'){const b=await bep20Status(env);await setSetting(env,'bep20_test_mode',b.testMode?'0':'1');await logAdmin(env,uid,'bep20_mode','setting','bep20_test_mode',b.testMode?'live':'test');return adminPayments(env,chat,mid);}
   if(d==='admin:bep20:toggle'){const b=await bep20Status(env);await setSetting(env,'feature_bep20',b.enabled?'0':'1');await logAdmin(env,uid,'bep20_toggle','setting','feature_bep20',b.enabled?'off':'on');return adminPayments(env,chat,mid);}
-  if(d==='admin:bep20:check'){const b=await bep20Status(env);const msg=`BEP20 check\nWallet: ${b.walletOk?'OK':'BAD'}\nContract: ${b.tokenOk?'OK':'BAD'}\nChain 56: ${b.chainOk?'OK':'BAD'}\nAPI key: ${b.apiOk?'OK':'MISSING'}\nMode: ${b.testMode?'TEST':'LIVE'}\nReady: ${b.ready?'YES':'NO'}`;return answerCb(env,c.id,msg,true);}
+  if(d==='admin:bep20:check'){
+    const b=await bep20Status(env);
+    let apiReachable=false,apiMessage='بررسی نشد';
+    if(b.walletOk&&b.tokenOk&&b.chainOk&&b.apiOk){
+      try{
+        const u=new URL('https://api.etherscan.io/v2/api');
+        u.searchParams.set('chainid',BSC_MAINNET_CHAIN_ID);
+        u.searchParams.set('module','account');
+        u.searchParams.set('action','tokentx');
+        u.searchParams.set('contractaddress',BSC_USDT_CONTRACT);
+        u.searchParams.set('address',b.wallet);
+        u.searchParams.set('page','1');u.searchParams.set('offset','1');u.searchParams.set('sort','desc');
+        u.searchParams.set('apikey',String(env.ETHERSCAN_API_KEY));
+        const r=await fetch(u.toString(),{headers:{accept:'application/json'}});
+        const body:any=await r.json().catch(()=>null);
+        apiReachable=r.ok&&body&&String(body.status??'')!=='0';
+        if(r.ok&&body&&Array.isArray(body.result))apiReachable=true;
+        apiMessage=apiReachable?'✅ API پاسخ معتبر داد':`❌ ${String(body?.message||body?.result||('HTTP '+r.status)).slice(0,140)}`;
+      }catch(e:any){apiMessage=`❌ ${String(e?.message||e).slice(0,140)}`;}
+    }
+    const ready=b.ready&&apiReachable;
+    const msg=`🔎 <b>تست تنظیمات BEP20</b>\n\n`+
+      `Wallet: ${b.walletOk?'✅ OK':'❌ BAD'}\n`+
+      `Contract whitelist: ${b.tokenOk?'✅ OK':'❌ BAD'}\n`+
+      `Chain ID 56: ${b.chainOk?'✅ OK':'❌ BAD'}\n`+
+      `API key: ${b.apiOk?'✅ موجود':'❌ وارد نشده'}\n`+
+      `API connection: ${esc(apiMessage)}\n`+
+      `Mode: <b>${b.testMode?'TEST':'LIVE'}</b>\n\n`+
+      `${ready?'✅ <b>BEP20 آماده تست تراکنش است.</b>':'❌ <b>BEP20 هنوز آماده نیست.</b>'}`;
+    return edit(env,chat,mid,msg,[[{text:'🔄 تست دوباره',callback_data:'admin:bep20:check'}],[{text:'⬅️ تنظیمات پرداخت',callback_data:'admin:payments'}]]);
+  }
   if(d==='admin:products')return adminProducts(env,chat,mid);
   if(d==='admin:categories')return adminCategories(env,chat,mid);
   if(d==='admin:channels')return adminChannels(env,chat,mid);
