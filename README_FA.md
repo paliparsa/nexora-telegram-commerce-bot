@@ -1,3 +1,7 @@
+# Nexora Commerce Bot v0.7.1
+
+> v0.7.1: BEP20 hardened scanner با Contract whitelist، Chain ID 56، 5 confirmation پیش‌فرض و Test Mode امن. راهنمای ارتقا: `UPGRADE_V071_FA.md`.
+
 # Nexora Commerce Bot — v0.7 Operations Suite
 
 نسخه v0.7 روی v0.6.2 ساخته شده و برای **آپدیت مستقیم Repo فعلی GitHub → Cloudflare Workers** طراحی شده است. دیتابیس فعلی حذف نمی‌شود و migration جدید `0006_operations_suite.sql` فقط قابلیت‌های جدید را اضافه می‌کند. فایل `wrangler.jsonc` عمداً در بسته آپدیت نیست تا `database_id` واقعی D1 شما دست نخورد.
