@@ -1,6 +1,6 @@
-# Nexora Commerce Bot v0.7.6
+# Nexora Commerce Bot v0.8.0
 
-> v0.7.6: BEP20 به RPC-first تغییر کرده، Contract به‌صورت on-chain بررسی می‌شود، و تست واقعی دیگر شرط اجباری LIVE نیست. راهنمای ارتقا: `UPGRADE_V076_FA.md`.
+> v0.8.0: Telegram Control & UX — مدیریت کامل‌تر داخل تلگرام، ویرایش تک‌فیلدی محصولات، دسته‌بندی نوع تحویل، ابزارهای سریع ادمین، حساب کاربر، علاقه‌مندی، اعلان موجودی، جزئیات سفارش/پرداخت و Backup. راهنمای ارتقا: `UPGRADE_V080_FA.md`.
 
 # Nexora Commerce Bot — v0.7 Operations Suite
 
@@ -221,3 +221,37 @@ Deploy گیت/کلادفلر حالا با `wrangler deploy --keep-vars` انج�
 ## v0.7.3 — Payment diagnostics
 
 پنل پرداخت اکنون تست مستقل و تست یکجای BEP20، TRC20، TON، کارت‌به‌کارت و Rate Engine دارد. BEP20 ابتدا BSC RPC را استفاده می‌کند و Etherscan فقط fallback/diagnostic است. تست BEP20 همچنین وجود Contract، `symbol()` و `decimals()` را مستقیماً روی زنجیره بررسی می‌کند. متغیر اختیاری `BSC_RPC_URL` برای تغییر RPC قابل استفاده است.
+
+
+## امکانات جدید v0.8.0
+
+### مدیریت ادمین داخل تلگرام
+- داشبورد خلاصه با سفارش امروز، Pending Payments، تیکت باز، موجودی کم و زمان آخرین اسکن.
+- آخرین سفارش‌ها، پرداخت‌های Pending، بررسی مجدد و تأیید دستی پرداخت.
+- جستجوی کاربر با Telegram ID / username / نام، مشاهده پروفایل، سفارش‌ها و افزایش/کاهش سریع Credit.
+- ارسال مجدد تحویل سفارش و ثبت تحویل دستی برای محصولات Manual.
+- افزودن استوک سریع با اعلان خودکار به کاربرانی که منتظر موجودی بودند.
+- Backup مستقیم CSV از کاربران، سفارش‌ها، Ledger و محصولات.
+- Broadcast متن/عکس/فایل با Preview قبل از قرار گرفتن در صف.
+
+### Product Manager
+- ویرایش جداگانه نام، توضیحات، قیمت فروش، هزینه، دسته‌بندی، نوع تحویل، گارانتی، فرمت تحویل، حداقل/حداکثر خرید، حد هشدار موجودی، ترتیب نمایش و وضعیت فعال/غیرفعال.
+- دسته‌بندی‌های فروشگاه قابل ساخت و ویرایش.
+- Delivery Type Manager با حالت‌های `stock`، `manual` و `info` و قالب تحویل قابل تنظیم.
+
+### تجربه کاربر
+- صفحه «حساب من»، گردش Credit، سفارش‌ها و پرداخت‌ها.
+- جزئیات سفارش، نمایش مجدد تحویل و خرید دوباره.
+- جزئیات پرداخت، زمان باقی‌مانده فاکتور، Recheck، Cancel، Copy TXID و Explorer.
+- علاقه‌مندی‌ها و «وقتی موجود شد خبرم کن».
+- نمایش نوع تحویل و گارانتی قبل از خرید.
+- FAQ داخلی.
+
+> هیچ Variable یا Secret جدیدی برای v0.8 لازم نیست. فقط migration `0007_telegram_control_ux.sql` باید توسط Deploy فعلی اجرا شود.
+
+
+### v0.8 polish additions
+- Admin-editable FAQ from Telegram.
+- Delivery types support editable ETA text and delivery templates.
+- Users can copy crypto destination/amount/TXID, recheck/cancel invoices, and resend completed digital delivery.
+- Quick top-up presets: $5 / $10 / $25 / $50.
