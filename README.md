@@ -1,4 +1,4 @@
-# Nexora Commerce Bot v0.8.0
+# Nexora Commerce Bot v0.9.0
 
 > v0.8.0: Telegram Control & UX — مدیریت کامل‌تر داخل تلگرام، ویرایش تک‌فیلدی محصولات، دسته‌بندی نوع تحویل، ابزارهای سریع ادمین، حساب کاربر، علاقه‌مندی، اعلان موجودی، جزئیات سفارش/پرداخت و Backup. راهنمای ارتقا: `UPGRADE_V080_FA.md`.
 
@@ -255,3 +255,29 @@ Deploy گیت/کلادفلر حالا با `wrangler deploy --keep-vars` انج�
 - Delivery types support editable ETA text and delivery templates.
 - Users can copy crypto destination/amount/TXID, recheck/cancel invoices, and resend completed digital delivery.
 - Quick top-up presets: $5 / $10 / $25 / $50.
+
+
+## v0.8.1
+
+- Official Wallex `USDTTMN` market rate for card-to-card invoices.
+- Card invoices persist the Toman amount and FX snapshot.
+- Exact credit-deficit top-up from checkout.
+- Manual product quantity up to available stock.
+- Delivery template presets plus custom templates.
+- Product availability broadcast with direct-buy button.
+- Migration: `0008_checkout_fx_templates_broadcast.sql`. No new secret is required.
+
+## v0.9.0 — Provider Engine
+
+Nexora can now sync and import products from a private upstream reseller API, apply local pricing rules, create upstream orders, poll pending orders, auto-deliver returned digital goods, refund deterministic failures, and alert admins on low provider balance. The upstream URL and API key are not hardcoded and must be stored as Cloudflare Secrets:
+
+```text
+NEXORA_PROVIDER_API_URL=<PRIVATE_BASE_URL>
+NEXORA_PROVIDER_API_KEY=<PRIVATE_API_KEY>
+```
+
+Supported local pricing modes: provider default markup, per-product percentage markup, fixed profit, and fixed selling price. Customer-facing messages do not expose provider URLs, upstream order IDs, source costs, or raw upstream errors.
+
+Migration: `migrations/0009_provider_engine.sql`. See `UPGRADE_V090_FA.md` for the Persian deployment guide.
+
+Security note: an operator who controls the Cloudflare runtime cannot be cryptographically prevented from discovering an upstream destination. If the upstream must also be hidden from installers/operators, place it behind a private relay you control.

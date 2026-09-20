@@ -1,6 +1,8 @@
-# Nexora Commerce Bot v0.8.0
+# Nexora Commerce Bot v0.9.0
 
-> v0.8.0: Telegram Control & UX — مدیریت کامل‌تر داخل تلگرام، ویرایش تک‌فیلدی محصولات، دسته‌بندی نوع تحویل، ابزارهای سریع ادمین، حساب کاربر، علاقه‌مندی، اعلان موجودی، جزئیات سفارش/پرداخت و Backup. راهنمای ارتقا: `UPGRADE_V080_FA.md`.
+> **v0.9.0 — Provider Engine:** همگام‌سازی کاتالوگ خارجی، Import محصول، قیمت‌گذاری شخصی، خرید و تحویل خودکار، Poll سفارش Pending، Refund خودکار در خطاهای قطعی، هشدار کمبود Balance و کنترل کامل از Telegram/Web Admin. اطلاعات اتصال Provider در UI مشتری نمایش داده نمی‌شود. راهنمای ارتقا: `UPGRADE_V090_FA.md`.
+
+> v0.8.1: Checkout & Delivery Polish — نرخ خودکار USDT/TMN برای کارت‌به‌کارت از API رسمی بازار والکس، شارژ مستقیم کسری Credit، تعداد دلخواه تا سقف موجودی، قالب‌های آماده تحویل و Broadcast آماده موجودشدن محصول. راهنمای ارتقا: `UPGRADE_V081_FA.md`.
 
 # Nexora Commerce Bot — v0.7 Operations Suite
 
@@ -211,7 +213,7 @@ Migration جدید فقط جدول‌ها/Indexهای امنیتی را اضاف
 
 ---
 
-Version: **0.8.0**
+Version: **0.9.0**
 
 
 ## اصلاحات v0.6.2
@@ -250,3 +252,72 @@ Deploy گیت/کلادفلر حالا با `wrangler deploy --keep-vars` انج�
 - شارژ سریع با مبالغ آماده $5 / $10 / $25 / $50.
 
 > هیچ Variable یا Secret جدیدی برای v0.8 لازم نیست. فقط migration `0007_telegram_control_ux.sql` باید توسط Deploy فعلی اجرا شود.
+
+
+## امکانات جدید v0.8.1
+
+- نرخ **USDT/TMN** برای کارت‌به‌کارت از endpoint رسمی `GET https://api.wallex.ir/v1/markets` و بازار `USDTTMN` دریافت می‌شود. برای محاسبه فاکتور از `askPrice` و در نبود آن `lastPrice/bidPrice` استفاده می‌شود. منبع نرخ به کاربر نمایش داده نمی‌شود.
+- مبلغ تومان و نرخ لحظه ساخت فاکتور در خود Invoice ذخیره می‌شود تا بعداً تغییر نرخ مبلغ فاکتور قبلی را عوض نکند.
+- در صورت کمبود Credit، Checkout مستقیماً دکمه **شارژ کسری دقیق** و **شارژ دلخواه** نشان می‌دهد.
+- کاربر می‌تواند تعداد محصول را به‌صورت دستی وارد کند. برای محصولات Stock-based سقف واقعی، موجودی لحظه‌ای محصول است.
+- برای هر Delivery Type سه قالب آماده **لینک فعال‌سازی / اکانت / کد یا لایسنس** و یک گزینه **شخصی‌سازی** وجود دارد. Placeholder اصلی `{stock_value}` است.
+- از صفحه هر محصول ادمین می‌تواند **اعلام موجودی** را Preview و سپس به صف Broadcast بفرستد. پیام دارای دکمه **خرید مستقیم** است.
+- تست کارت‌به‌کارت و Rate Engine حالا سلامت نرخ USDT/TMN را هم بررسی می‌کند.
+
+### Migration v0.8.1
+
+Deploy معمول پروژه migration زیر را اجرا می‌کند:
+
+`migrations/0008_checkout_fx_templates_broadcast.sql`
+
+Variable یا Secret جدیدی لازم نیست. API نرخ بازار عمومی است و کلید خصوصی نیاز ندارد.
+
+## v0.9.0 — Provider Engine
+
+Nexora اکنون می‌تواند محصولات یک API تامین خارجی را بدون وابسته کردن UI مشتری به نام یا آدرس آن سرویس دریافت و Fulfill کند. اتصال در کد Hardcode نشده و فقط از Cloudflare Secrets خوانده می‌شود.
+
+### راه‌اندازی
+در Cloudflare → Worker → Settings → Variables and Secrets این دو مورد را به‌صورت **Secret** بساز:
+
+```text
+NEXORA_PROVIDER_API_URL=<PRIVATE_BASE_URL>
+NEXORA_PROVIDER_API_KEY=<PRIVATE_API_KEY>
+```
+
+مقدار واقعی URL و API Key را داخل GitHub، README یا فایل‌های Repo قرار نده. `NEXORA_PROVIDER_API_URL` باید Base URL نسخه API باشد؛ Nexora مسیرهای `/account/info`، `/account/balance`، `/products` و `/orders` را خودش اضافه می‌کند.
+
+بعد از Deploy:
+1. Telegram Admin → فروش و محتوا → **تامین‌کننده**.
+2. **تست اتصال** را بزن.
+3. **Sync محصولات** را اجرا کن.
+4. از کاتالوگ، محصول موردنظر را **Import** کن.
+5. نام/توضیح/دسته/نوع تحویل محصول را مثل محصولات عادی Nexora شخصی‌سازی کن.
+6. برای قیمت، یکی از حالت‌های پیش‌فرض Provider، درصد سود، سود ثابت یا قیمت فروش ثابت را انتخاب کن.
+
+### قیمت‌گذاری
+- **Provider default:** هزینه خرید + درصد سود پیش‌فرض تامین‌کننده در Nexora.
+- **Percent:** درصد سود اختصاصی همان محصول.
+- **Fixed profit:** مبلغ Credit ثابت روی هزینه خرید.
+- **Fixed price:** قیمت فروش کاملاً دستی.
+- اگر قیمت یک محصول Provider را از Product Manager به‌صورت دستی عوض کنی، Auto Pricing همان محصول Lock می‌شود؛ از صفحه محصول می‌توانی Lock را برداری تا دوباره قیمت Sync شود.
+
+### Sync و Fulfillment
+- Stock و قیمت مبنا با Cron و interval قابل تنظیم Sync می‌شوند.
+- قبل از Checkout، محصول خارجی Refresh می‌شود تا قیمت/Stock قدیمی کمتر باعث خطا شود.
+- بعد از کسر Credit، سفارش خارجی ایجاد می‌شود.
+- تحویل موفق داخل سیستم تحویل خود Nexora ذخیره می‌شود و با `STOCK_ENCRYPTION_KEY` در D1 رمز می‌شود.
+- سفارش‌های Pending دارای شناسه قابل پیگیری، به‌صورت دوره‌ای Poll می‌شوند.
+- خطاهای قطعی سفارش باعث Refund خودکار Credit می‌شوند.
+- حالت Pending بدون شناسه قابل پیگیری وارد Manual Review می‌شود تا Retry کور و سفارش تکراری رخ ندهد.
+- Balance تامین‌کننده هر چند دقیقه Cache/Refresh می‌شود و پایین‌تر از Threshold برای ادمین هشدار می‌فرستد.
+
+### عدم افشای منبع به مشتری
+پیام‌ها و صفحات customer-facing نام Provider، Base URL، API Key، شناسه سفارش upstream، قیمت خرید و خطای خام upstream را نمایش نمی‌دهند. خطاهای خارجی برای مشتری به پیام‌های عمومی Nexora تبدیل می‌شوند.
+
+> **محدودیت مهم:** اگر شخصی مالک Repo/Cloudflare account و runtime باشد، هیچ برنامه‌ای نمی‌تواند منبع upstream را از او به‌صورت رمزنگاری‌شده و تضمینی مخفی کند؛ برای مخفی‌سازی حتی از اپراتور نصب، باید API را پشت یک Relay خصوصی که کنترلش دست خودت است قرار بدهی. v0.9 منبع را از مشتری نهایی و Repo عمومی مخفی نگه می‌دارد، مشروط به اینکه URL/Key فقط Secret باشند.
+
+### Migration
+`migrations/0009_provider_engine.sql`
+
+این migration اطلاعات قبلی را حذف نمی‌کند.
+
