@@ -1,6 +1,8 @@
 # Nexora Commerce Bot v0.9.0
 
-> v0.8.0: Telegram Control & UX — مدیریت کامل‌تر داخل تلگرام، ویرایش تک‌فیلدی محصولات، دسته‌بندی نوع تحویل، ابزارهای سریع ادمین، حساب کاربر، علاقه‌مندی، اعلان موجودی، جزئیات سفارش/پرداخت و Backup. راهنمای ارتقا: `UPGRADE_V080_FA.md`.
+> **v0.9.0 — Provider Engine:** همگام‌سازی کاتالوگ خارجی، Import محصول، قیمت‌گذاری شخصی، خرید و تحویل خودکار، Poll سفارش Pending، Refund خودکار در خطاهای قطعی، هشدار کمبود Balance و کنترل کامل از Telegram/Web Admin. اطلاعات اتصال Provider در UI مشتری نمایش داده نمی‌شود. راهنمای ارتقا: `UPGRADE_V090_FA.md`.
+
+> v0.8.1: Checkout & Delivery Polish — نرخ خودکار USDT/TMN برای کارت‌به‌کارت از API رسمی بازار والکس، شارژ مستقیم کسری Credit، تعداد دلخواه تا سقف موجودی، قالب‌های آماده تحویل و Broadcast آماده موجودشدن محصول. راهنمای ارتقا: `UPGRADE_V081_FA.md`.
 
 # Nexora Commerce Bot — v0.7 Operations Suite
 
@@ -20,7 +22,7 @@
 - رفع `403 Forbidden` روی **Refresh Rate** پنل وب: تزریق CSRF اصلاح شده و بررسی Origin شکننده حذف شده؛ محافظت همچنان با Session + SameSite + CSRF معتبر انجام می‌شود.
 - Deploy امن‌تر: migration **قبل از** deploy اجرا می‌شود تا کد جدید قبل از آماده شدن Schema بالا نیاید. `--keep-vars` نیز حفظ شده است.
 
-## Upgrade from v0.6.2 (GitHub → Cloudflare)
+## آپدیت سریع از v0.6.2
 
 1. ZIP v0.7 را روی Root Repo فعلی Upload/Replace کن.
 2. `wrangler.jsonc` فعلی را نگه دار؛ این ZIP آن را ندارد.
@@ -211,7 +213,7 @@ Migration جدید فقط جدول‌ها/Indexهای امنیتی را اضاف
 
 ---
 
-Version: **0.6.0**
+Version: **0.9.0**
 
 
 ## اصلاحات v0.6.2
@@ -237,47 +239,96 @@ Deploy گیت/کلادفلر حالا با `wrangler deploy --keep-vars` انج�
 ### Product Manager
 - ویرایش جداگانه نام، توضیحات، قیمت فروش، هزینه، دسته‌بندی، نوع تحویل، گارانتی، فرمت تحویل، حداقل/حداکثر خرید، حد هشدار موجودی، ترتیب نمایش و وضعیت فعال/غیرفعال.
 - دسته‌بندی‌های فروشگاه قابل ساخت و ویرایش.
-- Delivery Type Manager با حالت‌های `stock`، `manual` و `info` و قالب تحویل قابل تنظیم.
+- Delivery Type Manager با حالت‌های `stock`، `manual` و `info`، قالب پیام و زمان تقریبی تحویل قابل تنظیم.
+- FAQ از خود Telegram Admin قابل ویرایش است.
 
 ### تجربه کاربر
 - صفحه «حساب من»، گردش Credit، سفارش‌ها و پرداخت‌ها.
-- جزئیات سفارش، نمایش مجدد تحویل و خرید دوباره.
-- جزئیات پرداخت، زمان باقی‌مانده فاکتور، Recheck، Cancel، Copy TXID و Explorer.
+- جزئیات سفارش، نمایش تحویل، ارسال مجدد تحویل و خرید دوباره.
+- جزئیات پرداخت، زمان باقی‌مانده فاکتور، Recheck، Cancel، Copy آدرس/مبلغ/TXID و Explorer.
 - علاقه‌مندی‌ها و «وقتی موجود شد خبرم کن».
 - نمایش نوع تحویل و گارانتی قبل از خرید.
-- FAQ داخلی.
+- FAQ داخلی که ادمین متنش را مستقیم از بات مدیریت می‌کند.
+- شارژ سریع با مبالغ آماده $5 / $10 / $25 / $50.
 
 > هیچ Variable یا Secret جدیدی برای v0.8 لازم نیست. فقط migration `0007_telegram_control_ux.sql` باید توسط Deploy فعلی اجرا شود.
 
 
-### v0.8 polish additions
-- Admin-editable FAQ from Telegram.
-- Delivery types support editable ETA text and delivery templates.
-- Users can copy crypto destination/amount/TXID, recheck/cancel invoices, and resend completed digital delivery.
-- Quick top-up presets: $5 / $10 / $25 / $50.
+## امکانات جدید v0.8.1
 
+- نرخ **USDT/TMN** برای کارت‌به‌کارت از endpoint رسمی `GET https://api.wallex.ir/v1/markets` و بازار `USDTTMN` دریافت می‌شود. برای محاسبه فاکتور از `askPrice` و در نبود آن `lastPrice/bidPrice` استفاده می‌شود. منبع نرخ به کاربر نمایش داده نمی‌شود.
+- مبلغ تومان و نرخ لحظه ساخت فاکتور در خود Invoice ذخیره می‌شود تا بعداً تغییر نرخ مبلغ فاکتور قبلی را عوض نکند.
+- در صورت کمبود Credit، Checkout مستقیماً دکمه **شارژ کسری دقیق** و **شارژ دلخواه** نشان می‌دهد.
+- کاربر می‌تواند تعداد محصول را به‌صورت دستی وارد کند. برای محصولات Stock-based سقف واقعی، موجودی لحظه‌ای محصول است.
+- برای هر Delivery Type سه قالب آماده **لینک فعال‌سازی / اکانت / کد یا لایسنس** و یک گزینه **شخصی‌سازی** وجود دارد. Placeholder اصلی `{stock_value}` است.
+- از صفحه هر محصول ادمین می‌تواند **اعلام موجودی** را Preview و سپس به صف Broadcast بفرستد. پیام دارای دکمه **خرید مستقیم** است.
+- تست کارت‌به‌کارت و Rate Engine حالا سلامت نرخ USDT/TMN را هم بررسی می‌کند.
 
-## v0.8.1
+### Migration v0.8.1
 
-- Official Wallex `USDTTMN` market rate for card-to-card invoices.
-- Card invoices persist the Toman amount and FX snapshot.
-- Exact credit-deficit top-up from checkout.
-- Manual product quantity up to available stock.
-- Delivery template presets plus custom templates.
-- Product availability broadcast with direct-buy button.
-- Migration: `0008_checkout_fx_templates_broadcast.sql`. No new secret is required.
+Deploy معمول پروژه migration زیر را اجرا می‌کند:
+
+`migrations/0008_checkout_fx_templates_broadcast.sql`
+
+Variable یا Secret جدیدی لازم نیست. API نرخ بازار عمومی است و کلید خصوصی نیاز ندارد.
 
 ## v0.9.0 — Provider Engine
 
-Nexora can now sync and import products from a private upstream reseller API, apply local pricing rules, create upstream orders, poll pending orders, auto-deliver returned digital goods, refund deterministic failures, and alert admins on low provider balance. The upstream URL and API key are not hardcoded and must be stored as Cloudflare Secrets:
+Nexora اکنون می‌تواند محصولات یک API تامین خارجی را بدون وابسته کردن UI مشتری به نام یا آدرس آن سرویس دریافت و Fulfill کند. اتصال در کد Hardcode نشده و فقط از Cloudflare Secrets خوانده می‌شود.
+
+### راه‌اندازی
+در Cloudflare → Worker → Settings → Variables and Secrets این دو مورد را به‌صورت **Secret** بساز:
 
 ```text
 NEXORA_PROVIDER_API_URL=<PRIVATE_BASE_URL>
 NEXORA_PROVIDER_API_KEY=<PRIVATE_API_KEY>
 ```
 
-Supported local pricing modes: provider default markup, per-product percentage markup, fixed profit, and fixed selling price. Customer-facing messages do not expose provider URLs, upstream order IDs, source costs, or raw upstream errors.
+مقدار واقعی URL و API Key را داخل GitHub، README یا فایل‌های Repo قرار نده. `NEXORA_PROVIDER_API_URL` باید Base URL نسخه API باشد؛ Nexora مسیرهای `/account/info`، `/account/balance`، `/products` و `/orders` را خودش اضافه می‌کند.
 
-Migration: `migrations/0009_provider_engine.sql`. See `UPGRADE_V090_FA.md` for the Persian deployment guide.
+بعد از Deploy:
+1. Telegram Admin → فروش و محتوا → **تامین‌کننده**.
+2. **تست اتصال** را بزن.
+3. **Sync محصولات** را اجرا کن.
+4. از کاتالوگ، محصول موردنظر را **Import** کن.
+5. نام/توضیح/دسته/نوع تحویل محصول را مثل محصولات عادی Nexora شخصی‌سازی کن.
+6. برای قیمت، یکی از حالت‌های پیش‌فرض Provider، درصد سود، سود ثابت یا قیمت فروش ثابت را انتخاب کن.
 
-Security note: an operator who controls the Cloudflare runtime cannot be cryptographically prevented from discovering an upstream destination. If the upstream must also be hidden from installers/operators, place it behind a private relay you control.
+### قیمت‌گذاری
+- **Provider default:** هزینه خرید + درصد سود پیش‌فرض تامین‌کننده در Nexora.
+- **Percent:** درصد سود اختصاصی همان محصول.
+- **Fixed profit:** مبلغ Credit ثابت روی هزینه خرید.
+- **Fixed price:** قیمت فروش کاملاً دستی.
+- اگر قیمت یک محصول Provider را از Product Manager به‌صورت دستی عوض کنی، Auto Pricing همان محصول Lock می‌شود؛ از صفحه محصول می‌توانی Lock را برداری تا دوباره قیمت Sync شود.
+
+### Sync و Fulfillment
+- Stock و قیمت مبنا با Cron و interval قابل تنظیم Sync می‌شوند.
+- قبل از Checkout، محصول خارجی Refresh می‌شود تا قیمت/Stock قدیمی کمتر باعث خطا شود.
+- بعد از کسر Credit، سفارش خارجی ایجاد می‌شود.
+- تحویل موفق داخل سیستم تحویل خود Nexora ذخیره می‌شود و با `STOCK_ENCRYPTION_KEY` در D1 رمز می‌شود.
+- سفارش‌های Pending دارای شناسه قابل پیگیری، به‌صورت دوره‌ای Poll می‌شوند.
+- خطاهای قطعی سفارش باعث Refund خودکار Credit می‌شوند.
+- حالت Pending بدون شناسه قابل پیگیری وارد Manual Review می‌شود تا Retry کور و سفارش تکراری رخ ندهد.
+- Balance تامین‌کننده هر چند دقیقه Cache/Refresh می‌شود و پایین‌تر از Threshold برای ادمین هشدار می‌فرستد.
+
+### عدم افشای منبع به مشتری
+پیام‌ها و صفحات customer-facing نام Provider، Base URL، API Key، شناسه سفارش upstream، قیمت خرید و خطای خام upstream را نمایش نمی‌دهند. خطاهای خارجی برای مشتری به پیام‌های عمومی Nexora تبدیل می‌شوند.
+
+> **محدودیت مهم:** اگر شخصی مالک Repo/Cloudflare account و runtime باشد، هیچ برنامه‌ای نمی‌تواند منبع upstream را از او به‌صورت رمزنگاری‌شده و تضمینی مخفی کند؛ برای مخفی‌سازی حتی از اپراتور نصب، باید API را پشت یک Relay خصوصی که کنترلش دست خودت است قرار بدهی. v0.9 منبع را از مشتری نهایی و Repo عمومی مخفی نگه می‌دارد، مشروط به اینکه URL/Key فقط Secret باشند.
+
+### Migration
+`migrations/0009_provider_engine.sql`
+
+این migration اطلاعات قبلی را حذف نمی‌کند.
+
+
+---
+
+## کنترل دسترسی کاربران
+
+از مسیر **مدیریت → کاربران و پشتیبانی → جوین اجباری** دو کنترل مستقل در دسترس است:
+
+- **جوین اجباری:** کاربر باید عضو کانال‌ها/گروه‌های فعال باشد. برای بررسی قابل اتکا، بات را در آن‌ها Admin کن.
+- **احراز شماره:** در صورت فعال بودن، کاربر باید شماره متصل به همان Telegram account را با دکمه `📱 ارسال شماره من` بفرستد. ربات فقط Contactی را قبول می‌کند که Telegram `user_id` آن با فرستنده برابر باشد.
+
+هر دو قابلیت از داخل Telegram Admin قابل روشن/خاموش شدن هستند. احراز شماره به‌صورت پیش‌فرض خاموش است.
