@@ -281,3 +281,10 @@ Supported local pricing modes: provider default markup, per-product percentage m
 Migration: `migrations/0009_provider_engine.sql`. See `UPGRADE_V090_FA.md` for the Persian deployment guide.
 
 Security note: an operator who controls the Cloudflare runtime cannot be cryptographically prevented from discovering an upstream destination. If the upstream must also be hidden from installers/operators, place it behind a private relay you control.
+
+
+## CupponHub adapter (feature branch)
+
+The provider engine supports selecting the `cupponhub` adapter from the Telegram provider admin screen. It uses `/?action=balance`, `/?action=products`, `/?action=purchase`, and `/?action=order&order_id=...`, normalizes the supplier's USDT prices and delivered items, and retains the same idempotency key per local order. Existing `reseller_v1` calls remain available. The admin adapter selector currently switches the existing primary provider row (ID 1); it does not yet constitute a full multi-provider CRUD/routing panel.
+
+Set `NEXORA_PROVIDER_API_URL=https://cupponhub.shop/reseller/api` and `NEXORA_PROVIDER_API_KEY` as Cloudflare Worker secrets/variables; never commit the API key. Apply `migrations/0010_cupponhub_idempotency.sql` before deploying. Network timeouts, 409 conflicts, 429, and 503 responses are conservatively marked `manual_review` without automatic refund or a new idempotency key. For those cases, inspect supplier order history before manual action.
