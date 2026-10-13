@@ -1588,6 +1588,15 @@ async function exportAdminData(env:Env,type:string){const allowed=new Set(['user
 async function handleWebAdmin(req:Request,env:Env,url:URL):Promise<Response|null>{
   if(!url.pathname.startsWith('/admin-web'))return null;
   if(!env.ADMIN_WEB_PASSWORD||!env.ADMIN_SESSION_SECRET)return new Response('ADMIN_WEB_PASSWORD / ADMIN_SESSION_SECRET are not configured.',{status:503});
+  if(url.pathname==='/admin-web/receipt'){
+    const session:any=await validAdminSession(req,env);if(!session)return loginPage();
+    const pub=String(url.searchParams.get('invoice')||'').trim();if(!pub||pub.length>80)return new Response('شناسه فاکتور معتبر نیست.',{status:400});
+    const invoice:any=await env.DB.prepare('SELECT receipt_file_id FROM payment_invoices WHERE public_id=?').bind(pub).first();if(!invoice?.receipt_file_id)return new Response('رسیدی برای این فاکتور ثبت نشده است.',{status:404});
+    const meta:any=await tg(env,'getFile',{file_id:String(invoice.receipt_file_id)});const filePath=String(meta?.result?.file_path||'');if(!meta?.ok||!filePath||filePath.startsWith('/')||filePath.includes('..')||filePath.length>500)return new Response('دریافت مسیر رسید از تلگرام ناموفق بود.',{status:502});
+    const upstream=await fetch('https://api.telegram.org/file/bot'+env.BOT_TOKEN+'/'+filePath);if(!upstream.ok)return new Response('دریافت فایل رسید ناموفق بود.',{status:502});
+    const rawType=String(upstream.headers.get('content-type')||'application/octet-stream').split(';')[0].toLowerCase();const type=['image/jpeg','image/png','image/webp','application/pdf'].includes(rawType)?rawType:'application/octet-stream';
+    return new Response(upstream.body,{status:200,headers:{'content-type':type,'content-disposition':'inline; filename="nexora-receipt"','cache-control':'no-store','x-content-type-options':'nosniff','x-frame-options':'SAMEORIGIN','content-security-policy':"default-src 'none'; sandbox"}});
+  }
   if(url.pathname==='/admin-web/export'){const session:any=await validAdminSession(req,env);if(!session)return loginPage();const type=url.searchParams.get('type')||'all';const data=await exportAdminData(env,type);return new Response(JSON.stringify(data,null,2),{headers:{'content-type':'application/json; charset=utf-8','content-disposition':`attachment; filename="nexora-${type}-${new Date().toISOString().slice(0,10)}.json"`,'cache-control':'no-store'}});}
   if(req.method==='POST'){
     const fd=await req.formData();const action=String(fd.get('action')||'');
