@@ -9,4 +9,7 @@ ALTER TABLE broadcast_drafts ADD COLUMN button_text TEXT;
 ALTER TABLE broadcast_drafts ADD COLUMN button_callback TEXT;
 ALTER TABLE broadcast_drafts ADD COLUMN previewed_at TEXT;
 
+-- Force re-authentication so every active session receives a verified identity under the new login flow.
+DELETE FROM admin_sessions;
+
 CREATE INDEX IF NOT EXISTS idx_admin_sessions_identity ON admin_sessions(admin_telegram_id, expires_at);
