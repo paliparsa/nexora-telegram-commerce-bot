@@ -301,7 +301,10 @@ async function bep20Status(env:Env){
   const wallet=await getSetting(env,'wallet_bep20',env.USDT_BEP20_WALLET||'');
   const token=bep20Token(env),chain=String(env.ETHERSCAN_CHAIN_ID||BSC_MAINNET_CHAIN_ID).trim();
   const testMode=await featureEnabled(env,'bep20_test_mode',true);
-  const liveVerified=await featureEnabled(env,'bep20_live_verified',false);
+  const verifiedFlag=await featureEnabled(env,'bep20_live_verified',false);
+  const verifiedWallet=await getSetting(env,'bep20_live_verified_wallet','');
+  const verifiedToken=await getSetting(env,'bep20_live_verified_token','');
+  const liveVerified=verifiedFlag&&normEvm(wallet)===normEvm(verifiedWallet)&&normEvm(token)===normEvm(verifiedToken);
   const enabled=await featureEnabled(env,'feature_bep20',true);
   const walletOk=/^0x[a-fA-F0-9]{40}$/.test(wallet);
   const tokenOk=/^0x[a-fA-F0-9]{40}$/.test(token);
@@ -614,6 +617,8 @@ async function scanPendingCrypto(env:Env,onlyPublicId?:string,ownerTelegramId?:n
             try{await env.DB.batch([
               env.DB.prepare("INSERT OR IGNORE INTO payment_events(invoice_id,public_id,telegram_id,event_type,network,tx_hash,expected_amount,detected_amount,confirmations,details) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(inv.id,inv.public_id,inv.telegram_id,'bep20_test_detected',inv.network,hash,expected,tx.amount,tx.confirmations||0,'Explicit admin-created BEP20 test invoice: detected and not credited'),
               env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('bep20_live_verified','1') ON CONFLICT(key) DO UPDATE SET value='1'"),
+              env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('bep20_live_verified_wallet',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(String(inv.destination||'')),
+              env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('bep20_live_verified_token',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(bep20Token(env)),
               env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('bep20_live_test_invoice_id','') ON CONFLICT(key) DO UPDATE SET value=''")
             ]);}catch{}
             await notifyAdmins(env,'payment_issue',`🧪 <b>تست واقعی BEP20 موفق بود</b>\n\n🧾 <code>${inv.public_id}</code>\n✅ تراکنش در شبکه شناسایی شد\n✅ مقصد و مبلغ دقیق تطبیق داشت\n✅ تأییدها: ${Number(tx.confirmations||0)}\n🔗 <code>${hash}</code>\n\nاین فاکتور تست اعتبار اضافه نکرد. اکنون امکان فعال‌کردن LIVE باز است.`,inv.public_id);
@@ -1188,7 +1193,9 @@ async function handleAdminState(env:Env,m:Message,state:string){
       if(key==='card_number'){const digits=value.replace(/[^0-9]/g,'');if(digits.length<12||digits.length>24){await send(env,m.chat.id,'❌ شماره کارت/حساب معتبر نیست.');return true;}value=digits;}
       if(key==='card_holder'&&(value.length<2||value.length>120)){await send(env,m.chat.id,'❌ نام صاحب حساب معتبر نیست.');return true;}
     }
-    await setSetting(env,key,value); await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run(); await logAdmin(env,uid,'payment_setting','setting',key,'updated'); await send(env,m.chat.id,'✅ تنظیم ذخیره شد.',[[{text:'💳 تنظیمات پرداخت',callback_data:'admin:payments'}]]); return true;
+    await setSetting(env,key,value);
+    if(key==='wallet_bep20'){await setSetting(env,'bep20_live_verified','0');await setSetting(env,'bep20_live_test_invoice_id','');}
+    await env.DB.prepare('UPDATE users SET state=NULL WHERE telegram_id=?').bind(uid).run(); await logAdmin(env,uid,'payment_setting','setting',key,'updated'); await send(env,m.chat.id,'✅ تنظیم ذخیره شد.',[[{text:'💳 تنظیمات پرداخت',callback_data:'admin:payments'}]]); return true;
   }
   if(state==='admin_category_new'){
     const parts=text.split(/\s+/); let emoji='🛍',title=text;if(parts.length>1&&/[^\w\u0600-\u06FF]/u.test(parts[0])){emoji=parts.shift()!;title=parts.join(' ');} if(!title){await send(env,m.chat.id,'نام دسته را بفرست.');return true;}
@@ -1378,7 +1385,7 @@ async function handleCallback(env:Env,c:CallbackQuery){
   if(d.startsWith('admin:blacklist:add:')){const kind=d.split(':')[3];await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`admin_blacklist_add:${kind}`,uid).run();return edit(env,chat,mid,`مقدار ${kind} را بفرست.`);}
   if(d==='admin:blacklist:remove'){await env.DB.prepare("UPDATE users SET state='admin_blacklist_remove' WHERE telegram_id=?").bind(uid).run();return edit(env,chat,mid,'برای حذف فرمت <code>kind value</code> را بفرست؛ مثال: <code>username testuser</code>');}
   if(d==='admin:scan'){const n=await scanPendingCrypto(env);await setSetting(env,'scanner_last_run',nowIso()); await logAdmin(env,uid,'crypto_scan',undefined,undefined,`settled=${n}`);return answerCb(env,c.id,`${n} پرداخت جدید تأیید شد.`,true);}
-  if(d==='admin:bep20:mode'){const b=await bep20Status(env);if(b.testMode&&!b.liveVerified)return answerCb(env,c.id,'فعال‌سازی LIVE قفل است. ابتدا فاکتور تست واقعی BEP20 را پرداخت کن و منتظر تأیید شبکه بمان.',true);await setSetting(env,'bep20_test_mode',b.testMode?'0':'1');await logAdmin(env,uid,'bep20_mode','setting','bep20_test_mode',b.testMode?'live':'test');return adminPayments(env,chat,mid);}
+  if(d==='admin:bep20:mode'){const b=await bep20Status(env);if(b.testMode&&!b.liveVerified)return answerCb(env,c.id,'فعال‌سازی LIVE قفل است. ابتدا فاکتور تست واقعی BEP20 را پرداخت کن و منتظر تأیید شبکه بمان.',true);await setSetting(env,'bep20_test_mode',b.testMode?'0':'1');if(!b.testMode){await setSetting(env,'bep20_live_verified','0');await setSetting(env,'bep20_live_test_invoice_id','');}await logAdmin(env,uid,'bep20_mode','setting','bep20_test_mode',b.testMode?'live':'test');return adminPayments(env,chat,mid);}
   if(d==='admin:bep20:toggle'){const b=await bep20Status(env);await setSetting(env,'feature_bep20',b.enabled?'0':'1');await logAdmin(env,uid,'bep20_toggle','setting','feature_bep20',b.enabled?'off':'on');return adminPayments(env,chat,mid);}
   if(d==='admin:bep20:testinvoice'){
     if(!isAdmin(env,uid))return answerCb(env,c.id,'دسترسی ادمین لازم است.',true);
@@ -1704,7 +1711,7 @@ async function handleWebAdmin(req:Request,env:Env,url:URL):Promise<Response|null
     }
     if(action==='ton_rate_save'){const mode=String(fd.get('mode')||'auto')==='manual'?'manual':'auto';const manual=Number(fd.get('manual_rate')||0);if(!Number.isFinite(manual)||manual<0||manual>1e6)return new Response('invalid rate',{status:400});await setSetting(env,'ton_rate_mode',mode);await setSetting(env,'ton_usd_rate',String(manual));if(mode==='auto')await refreshTonRate(env,true);await logAdmin(env,webAdminIdentity(session),'web_ton_rate','setting','ton_rate_mode',mode);return Response.redirect(`${url.origin}/admin-web?tab=payments`,303);}
     if(action==='ton_rate_refresh'){await refreshRates(env,true);await logAdmin(env,webAdminIdentity(session),'web_rate_refresh','setting','rates','manual refresh');return Response.redirect(`${url.origin}/admin-web?tab=payments`,303);}
-    if(action==='bep20_mode_toggle'){const b=await bep20Status(env);if(b.testMode&&!b.liveVerified){await logAdmin(env,webAdminIdentity(session),'web_bep20_live_blocked','setting','bep20_test_mode','live verification required');return new Response('LIVE activation blocked: complete the explicit real BEP20 test invoice first.',{status:409,headers:{'content-type':'text/plain; charset=utf-8'}});}await setSetting(env,'bep20_test_mode',b.testMode?'0':'1');await logAdmin(env,webAdminIdentity(session),'web_bep20_mode','setting','bep20_test_mode',b.testMode?'live':'test');return Response.redirect(`${url.origin}/admin-web?tab=payments`,303);}
+    if(action==='bep20_mode_toggle'){const b=await bep20Status(env);if(b.testMode&&!b.liveVerified){await logAdmin(env,webAdminIdentity(session),'web_bep20_live_blocked','setting','bep20_test_mode','live verification required');return new Response('LIVE activation blocked: complete the explicit real BEP20 test invoice first.',{status:409,headers:{'content-type':'text/plain; charset=utf-8'}});}await setSetting(env,'bep20_test_mode',b.testMode?'0':'1');if(!b.testMode){await setSetting(env,'bep20_live_verified','0');await setSetting(env,'bep20_live_test_invoice_id','');}await logAdmin(env,webAdminIdentity(session),'web_bep20_mode','setting','bep20_test_mode',b.testMode?'live':'test');return Response.redirect(`${url.origin}/admin-web?tab=payments`,303);}
     if(action==='bep20_feature_toggle'){const b=await bep20Status(env);await setSetting(env,'feature_bep20',b.enabled?'0':'1');await logAdmin(env,webAdminIdentity(session),'web_bep20_toggle','setting','feature_bep20',b.enabled?'off':'on');return Response.redirect(`${url.origin}/admin-web?tab=payments`,303);}
     if(action==='provider_save'){
       const idRaw=String(fd.get('provider_id')||'').trim(),id=idRaw?Number(idRaw):0,alias=String(fd.get('alias')||'').trim(),adapter=String(fd.get('adapter')||''),base=String(fd.get('api_base')||'').trim().replace(/\/$/,'');
@@ -1824,7 +1831,9 @@ async function handleWebAdmin(req:Request,env:Env,url:URL):Promise<Response|null
       if(ton&&(!/^[A-Za-z0-9_\-+=/]{10,160}$/.test(ton)))return new Response('آدرس TON معتبر نیست.',{status:400});
       if(card&&!/^[0-9۰-۹ -]{10,40}$/.test(card))return new Response('شماره کارت معتبر نیست.',{status:400});
       if(holder.length>100)return new Response('نام صاحب کارت بیش از حد طولانی است.',{status:400});
+      const oldBep=await getSetting(env,'wallet_bep20',env.USDT_BEP20_WALLET||'');
       await env.DB.batch([env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('wallet_bep20',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(bep),env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('wallet_trc20',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(trc),env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('wallet_ton',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(ton),env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('card_number',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(card),env.DB.prepare("INSERT INTO bot_settings(key,value) VALUES('card_holder',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(holder)]);
+      if(normEvm(oldBep)!==normEvm(bep)){await setSetting(env,'bep20_live_verified','0');await setSetting(env,'bep20_live_test_invoice_id','');}
       await logAdmin(env,webAdminIdentity(session),'web_payment_addresses_save','setting','payment_addresses');return Response.redirect(url.origin+'/admin-web?tab=payments',303);
     }
     if(action==='payment_approve'){const pub=String(fd.get('public_id')||'').trim();if(!pub)return new Response('شناسه فاکتور لازم است.',{status:400});const ok=await adminApprovePayment(env,0,pub);if(!ok)return new Response('پرداخت پیدا نشد، وضعیت آن تغییر کرده یا تأیید انجام نشد.',{status:409});return Response.redirect(url.origin+'/admin-web?tab=payments',303);}
