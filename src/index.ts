@@ -1496,6 +1496,7 @@ function webPager(url:URL,total:number,page:number,size=25,param='page'){
 }
 function webSortLink(url:URL,key:string,label:string,sort:string,dir:string,sortParam='sort',dirParam='dir',pageParam='page'){
   const u=new URL(url.toString());const nextDir=sort===key&&dir==='asc'?'desc':'asc';u.searchParams.set(sortParam,key);u.searchParams.set(dirParam,nextDir);u.searchParams.set(pageParam,'1');
+  for(const p of ['page','provider_page','catalog_page','ledger_page','referrals_page','logs_page','sessions_page','blacklist_page','risk_page','messages_page'])u.searchParams.set(p,'1');
   return '<a href="'+webEsc(u.pathname+u.search)+'" style="text-decoration:none">'+label+(sort===key?(dir==='asc'?' ↑':' ↓'):' ↕')+'</a>';
 }
 async function adminDashboardHtml(env:Env){
