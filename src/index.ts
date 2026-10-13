@@ -22,6 +22,7 @@ export interface Env {
   REFERRAL_REWARD: string;
   INVOICE_EXPIRE_MINUTES: string;
   ADMIN_WEB_PASSWORD?: string;
+  ADMIN_WEB_USERS?: string;
   ADMIN_SESSION_SECRET?: string;
   SETUP_SECRET?: string;
   STOCK_ENCRYPTION_KEY?: string;
@@ -1452,7 +1453,16 @@ async function loginIpHash(req:Request,env:Env){return hmacHex(env.ADMIN_SESSION
 async function isLoginBlocked(req:Request,env:Env){const ip=await loginIpHash(req,env);const r:any=await env.DB.prepare("SELECT blocked_until FROM admin_login_attempts WHERE ip_hash=? AND blocked_until IS NOT NULL AND datetime(blocked_until)>datetime('now')").bind(ip).first();return !!r;}
 async function recordLoginFailure(req:Request,env:Env){const ip=await loginIpHash(req,env);await env.DB.prepare("INSERT INTO admin_login_attempts(ip_hash,attempts,window_started,updated_at) VALUES(?,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(ip_hash) DO UPDATE SET attempts=CASE WHEN datetime(window_started)<=datetime('now','-15 minutes') THEN 1 ELSE attempts+1 END,window_started=CASE WHEN datetime(window_started)<=datetime('now','-15 minutes') THEN CURRENT_TIMESTAMP ELSE window_started END,blocked_until=CASE WHEN (CASE WHEN datetime(window_started)<=datetime('now','-15 minutes') THEN 1 ELSE attempts+1 END)>=5 THEN datetime('now','+30 minutes') ELSE blocked_until END,updated_at=CURRENT_TIMESTAMP").bind(ip).run();}
 async function clearLoginFailures(req:Request,env:Env){await env.DB.prepare('DELETE FROM admin_login_attempts WHERE ip_hash=?').bind(await loginIpHash(req,env)).run();}
-async function makeAdminSession(req:Request,env:Env){const token=randomHex(32),hash=await sha256Hex(token),csrf=randomHex(24),exp=new Date(Date.now()+12*60*60*1000).toISOString();const ip=await loginIpHash(req,env),ua=await sha256Hex(req.headers.get('user-agent')||'');await env.DB.prepare('INSERT INTO admin_sessions(token_hash,csrf_token,expires_at,ip_hash,user_agent_hash) VALUES(?,?,?,?,?)').bind(hash,csrf,exp,ip,ua).run();return {token,csrf};}
+async function makeAdminSession(req:Request,env:Env,adminTelegramId=0,adminUsername=''){const token=randomHex(32),hash=await sha256Hex(token),csrf=randomHex(24),exp=new Date(Date.now()+12*60*60*1000).toISOString();const ip=await loginIpHash(req,env),ua=await sha256Hex(req.headers.get('user-agent')||'');await env.DB.prepare('INSERT INTO admin_sessions(token_hash,csrf_token,expires_at,ip_hash,user_agent_hash,admin_telegram_id,admin_username) VALUES(?,?,?,?,?,?,?)').bind(hash,csrf,exp,ip,ua,adminTelegramId||null,adminUsername||null).run();return {token,csrf};}
+function webAdminAccounts(env:Env):Array<{username:string;password:string;telegram_id:number}>{
+  try{const raw=JSON.parse(String(env.ADMIN_WEB_USERS||'[]'));if(!Array.isArray(raw))return [];return raw.filter((x:any)=>x&&typeof x.username==='string'&&typeof x.password==='string'&&Number.isSafeInteger(Number(x.telegram_id))&&Number(x.telegram_id)>0).map((x:any)=>({username:x.username.trim(),password:x.password,telegram_id:Number(x.telegram_id)})).filter((x:any)=>x.username.length>0&&x.username.length<=80&&x.password.length>=12);}
+  catch{return [];}
+}
+function webAdminIdentity(session:any){return Number(session?.admin_telegram_id||0);}
+function webBroadcastPreview(text:string){
+  let s=webEsc(text).replace(/&lt;(\/?)(b|strong)&gt;/gi,'<$1strong>').replace(/&lt;(\/?)(i|em)&gt;/gi,'<$1em>').replace(/&lt;(\/?)(u|s|code|pre)&gt;/gi,'<$1$2>');
+  return s.replace(/\n/g,'<br>');
+}
 async function validAdminSession(req:Request,env:Env){
   if(!env.ADMIN_WEB_PASSWORD||!env.ADMIN_SESSION_SECRET)return null; const token=cookieValue(req,'nexora_admin'); if(!token)return null; const hash=await sha256Hex(token); const row:any=await env.DB.prepare("SELECT * FROM admin_sessions WHERE token_hash=? AND datetime(expires_at)>datetime('now')").bind(hash).first();return row||null;
 }
@@ -1473,7 +1483,7 @@ function webPage(title:string,body:string,active='dashboard',csrf=''){
   return csrf?injectCsrf(html,csrf):html;
 }
 function loginPage(msg=''){
-  return new Response(`<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Nexora Admin</title><style>body{margin:0;background:#0b1020;color:#fff;font-family:system-ui;display:grid;place-items:center;min-height:100vh}.box{width:min(92vw,420px);background:#121a2d;border:1px solid #263454;border-radius:18px;padding:24px}input,button{width:100%;padding:12px;border-radius:10px;border:1px solid #314267;background:#0c1427;color:#fff;margin-top:10px}button{background:#315da8;cursor:pointer}.err{color:#ff8793}</style><div class="box"><h2>ورود به Nexora Admin</h2><p>رمز پنل مدیریت را وارد کن.</p>${msg?`<p class="err">${webEsc(msg)}</p>`:''}<form method="post" action="/admin-web"><input type="hidden" name="action" value="login"><input type="password" name="password" autocomplete="current-password" required><button>ورود</button></form></div></html>`,{headers:{'content-type':'text/html; charset=utf-8'}});
+  return new Response(`<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Nexora Admin</title><style>body{margin:0;background:#0b1020;color:#fff;font-family:system-ui;display:grid;place-items:center;min-height:100vh}.box{width:min(92vw,420px);background:#121a2d;border:1px solid #263454;border-radius:18px;padding:24px}input,button{width:100%;padding:12px;border-radius:10px;border:1px solid #314267;background:#0c1427;color:#fff;margin-top:10px}button{background:#315da8;cursor:pointer}.err{color:#ff8793}</style><div class="box"><h2>ورود به Nexora Admin</h2><p>رمز پنل مدیریت را وارد کن.</p>${msg?`<p class="err">${webEsc(msg)}</p>`:''}<form method="post" action="/admin-web"><input type="hidden" name="action" value="login"><input name="username" autocomplete="username" placeholder="نام کاربری (برای ادمین‌های مستقل)" maxlength="80"><input type="password" name="password" autocomplete="current-password" required><button>ورود</button></form></div></html>`,{headers:{'content-type':'text/html; charset=utf-8'}});
 }
 async function adminDashboardHtml(env:Env){
   const [users,orders,topups,pendingPayments,tickets,stock,periods,recentOrders]=await Promise.all([
@@ -1611,9 +1621,11 @@ async function handleWebAdmin(req:Request,env:Env,url:URL):Promise<Response|null
     const fd=await req.formData();const action=String(fd.get('action')||'');
     if(action==='login'){
       if(await isLoginBlocked(req,env))return loginPage('تلاش‌های ناموفق زیادی ثبت شده. ۳۰ دقیقه بعد دوباره امتحان کن.');
-      const got=await sha256Hex(String(fd.get('password')||'')),expected=await sha256Hex(env.ADMIN_WEB_PASSWORD);
-      if(!safeEq(got,expected)){await recordLoginFailure(req,env);return loginPage('رمز اشتباه است.');}
-      await clearLoginFailures(req,env);const session=await makeAdminSession(req,env);return new Response(null,{status:303,headers:{location:'/admin-web','set-cookie':`nexora_admin=${encodeURIComponent(session.token)}; Path=/admin-web; Max-Age=43200; HttpOnly; Secure; SameSite=Strict`}});
+      const accounts=webAdminAccounts(env);let identity={telegram_id:0,username:''};let authenticated=false;
+      if(accounts.length){const username=String(fd.get('username')||'').trim();const password=String(fd.get('password')||'');const account=accounts.find((x)=>x.username===username);if(account&&safeEq(await sha256Hex(password),await sha256Hex(account.password))){identity={telegram_id:account.telegram_id,username:account.username};authenticated=true;}}
+      else {const got=await sha256Hex(String(fd.get('password')||'')),expected=await sha256Hex(env.ADMIN_WEB_PASSWORD||'');authenticated=safeEq(got,expected);}
+      if(!authenticated){await recordLoginFailure(req,env);return loginPage('نام کاربری یا رمز اشتباه است.');}
+      await clearLoginFailures(req,env);const session=await makeAdminSession(req,env,identity.telegram_id,identity.username);return new Response(null,{status:303,headers:{location:'/admin-web','set-cookie':`nexora_admin=${encodeURIComponent(session.token)}; Path=/admin-web; Max-Age=43200; HttpOnly; Secure; SameSite=Strict`}});
     }
     const session:any=await validAdminSession(req,env);if(!session)return loginPage();
     if(!safeEq(String(fd.get('csrf')||''),String(session.csrf_token||'')))return new Response('invalid csrf token',{status:403});
