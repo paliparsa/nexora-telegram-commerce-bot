@@ -283,8 +283,18 @@ Migration: `migrations/0009_provider_engine.sql`. See `UPGRADE_V090_FA.md` for t
 Security note: an operator who controls the Cloudflare runtime cannot be cryptographically prevented from discovering an upstream destination. If the upstream must also be hidden from installers/operators, place it behind a private relay you control.
 
 
-## CupponHub adapter (feature branch)
 
-The provider engine supports selecting the `cupponhub` adapter from the Telegram provider admin screen. It uses `/?action=balance`, `/?action=products`, `/?action=purchase`, and `/?action=order&order_id=...`, normalizes the supplier's USDT prices and delivered items, and retains the same idempotency key per local order. Existing `reseller_v1` calls remain available. The admin adapter selector currently switches the existing primary provider row (ID 1); it does not yet constitute a full multi-provider CRUD/routing panel.
+## Multi-provider engine and CupponHub
 
-Set `NEXORA_PROVIDER_API_URL=https://cupponhub.shop/reseller/api` and `NEXORA_PROVIDER_API_KEY` as Cloudflare Worker secrets/variables; never commit the API key. Apply `migrations/0010_cupponhub_idempotency.sql` before deploying. Network timeouts, 409 conflicts, 429, and 503 responses are conservatively marked `manual_review` without automatic refund or a new idempotency key. For those cases, inspect supplier order history before manual action.
+The provider engine supports the existing `reseller_v1` contract and CupponHub's action-based API. The web admin page (`/admin-web?tab=provider`) supports adding, editing, enabling/disabling, syncing and testing multiple providers; each provider has its own adapter, API base URL, encrypted API key, markup/low-balance settings and sync interval. Products remain linked to the provider product they were imported from, and order fulfillment uses that provider's adapter. Providers with historical orders or linked local products are intentionally disabled rather than deleted to preserve references.
+
+CupponHub actions: `/?action=balance`, `/?action=products`, `/?action=purchase`, and `/?action=order&order_id=...`. Purchase requests use a stable per-local-order `Idempotency-Key`. Network timeouts, HTTP 409, 429 and 503 are conservatively held for manual review; there is no automatic failover or refund while purchase outcome is ambiguous.
+
+### Required deployment configuration
+
+1. Set Cloudflare Worker secret `PROVIDER_CONFIG_ENCRYPTION_KEY` to a high-entropy value of at least 32 characters. This key protects provider API credentials at rest using AES-GCM; losing it makes saved credentials unreadable.
+2. Apply D1 migration `0010_cupponhub_idempotency.sql` before deploying the matching Worker.
+3. In the web admin, add a provider with API base URL (for CupponHub: `https://cupponhub.shop/reseller/api`) and API key. Keys are write-only in the UI and are never rendered back. The legacy provider #1 can continue using `NEXORA_PROVIDER_API_URL` and `NEXORA_PROVIDER_API_KEY` until its credentials are migrated into encrypted provider settings.
+4. Run Sync and connection test per provider, then import/link products. No deployment or production database migration is performed by this code change.
+
+A GitHub Actions workflow runs `npm run typecheck` for pushes and pull requests.
