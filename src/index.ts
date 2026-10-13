@@ -27,6 +27,7 @@ export interface Env {
   STOCK_ENCRYPTION_KEY?: string;
   NEXORA_PROVIDER_API_URL?: string;
   NEXORA_PROVIDER_API_KEY?: string;
+  PROVIDER_CONFIG_ENCRYPTION_KEY?: string;
 }
 
 type TgUser = { id:number; username?:string; first_name?:string };
@@ -782,11 +783,18 @@ function cupponHubProduct(x:any):ProviderProductRemote{return {id:String(x?.key|
 type ProviderProductRemote={id?:number|string;productId?:number|string;name?:string;title?:string;description?:string;price?:string|number;currency?:string;stock?:number;inStock?:boolean};
 type ProviderCallResult={ok:boolean;status:number;data:any;error?:string};
 function providerCfg(env:Env){return {base:String(env.NEXORA_PROVIDER_API_URL||'').trim().replace(/\/$/,''),key:String(env.NEXORA_PROVIDER_API_KEY||'').trim()};}
+function bytesToBase64(bytes:Uint8Array){let binary='';for(const b of bytes)binary+=String.fromCharCode(b);return btoa(binary);}
+function base64ToBytes(value:string){const binary=atob(value);return Uint8Array.from(binary,c=>c.charCodeAt(0));}
+async function providerCryptoKey(env:Env){const raw=String(env.PROVIDER_CONFIG_ENCRYPTION_KEY||'').trim();if(raw.length<32)throw new Error('provider_config_encryption_key_missing');const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(raw));return crypto.subtle.importKey('raw',digest,{name:'AES-GCM'},false,['encrypt','decrypt']);}
+async function encryptProviderSecret(env:Env,plain:string){const iv=crypto.getRandomValues(new Uint8Array(12));const key=await providerCryptoKey(env);const cipher=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(plain));return 'v1.'+bytesToBase64(iv)+'.'+bytesToBase64(new Uint8Array(cipher));}
+async function decryptProviderSecret(env:Env,value:string){if(!value)return '';const p=value.split('.');if(p.length!==3||p[0]!=='v1')throw new Error('provider_secret_format_invalid');const key=await providerCryptoKey(env);const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:base64ToBytes(p[1])},key,base64ToBytes(p[2]));return new TextDecoder().decode(plain);}
+async function providerConfigFor(env:Env,providerId=1){const row:any=await env.DB.prepare('SELECT api_base,api_key_ciphertext FROM providers WHERE id=?').bind(providerId).first();if(row?.api_base&&row?.api_key_ciphertext){try{return {base:String(row.api_base).trim().replace(/\/$/,''),key:await decryptProviderSecret(env,String(row.api_key_ciphertext))};}catch{return {base:'',key:''};}}if(providerId===1)return providerCfg(env);return {base:'',key:''};}
+async function providerReadyFor(env:Env,providerId=1){const c=await providerConfigFor(env,providerId);return /^https:\/\//i.test(c.base)&&c.key.length>=8;}
 function providerReady(env:Env){const c=providerCfg(env);return /^https:\/\//i.test(c.base)&&c.key.length>=8;}
-async function providerCall(env:Env,path:string,init:RequestInit={}):Promise<ProviderCallResult>{
-  const c=providerCfg(env);if(!providerReady(env))return {ok:false,status:0,data:null,error:'provider_not_configured'};
+async function providerCall(env:Env,path:string,init:RequestInit={},providerId=1):Promise<ProviderCallResult>{
+  const c=await providerConfigFor(env,providerId);if(!/^https:\/\//i.test(c.base)||c.key.length<8)return {ok:false,status:0,data:null,error:'provider_not_configured'};
   const headers=new Headers(init.headers||{});headers.set('X-API-Key',c.key);headers.set('Accept','application/json');if(init.body)headers.set('Content-Type','application/json');
-  try{const r=await fetch(`${c.base}${path.startsWith('/')?path:'/'+path}`,{...init,headers});let data:any=null;try{data=await r.json();}catch{data=null;}return {ok:r.ok&&data?.ok!==false,status:r.status,data,error:data?.error||(!r.ok?`http_${r.status}`:undefined)};}catch(e){return {ok:false,status:0,data:null,error:`network_error:${String(e).slice(0,120)}`};}
+  try{const r=await fetch(`${c.base}${path.startsWith('/')?path:'/'+path}`,{...init,headers});let data:any=null;try{data=await r.json();}catch{data=null;}return {ok:r.ok&&data?.ok!==false,status:r.status,data,error:data?.error||(!r.ok?`http_${r.status}`:undefined)};}catch{return {ok:false,status:0,data:null,error:'network_error'};}
 }
 function providerUserMessage(code:string){
   if(code==='out_of_stock'||code==='product_not_found')return '❌ این محصول در حال حاضر موجود نیست. مبلغ کسرشده خودکار به موجودی شما برگشت.';
