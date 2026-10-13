@@ -322,11 +322,11 @@ async function paymentConfig(env:Env){
     cardHolder: await getSetting(env,'card_holder',env.CARD_HOLDER||'')
   };
 }
-async function paymentMethods(env:Env,chat:number,mid:number,usd:number,credits:number){
+async function paymentMethods(env:Env,chat:number,mid:number,usd:number,credits:number,backData='credit:buy'){
   const token=`${usd}:${credits}`; const cfg=await paymentConfig(env); const rows:Btn[][]=[];
   if(await featureEnabled(env,'feature_crypto',true)){const b=await bep20Status(env);if(b.ready&&(!b.testMode||isAdmin(env,chat)))rows.push([{text:b.testMode?'🧪 USDT (BEP20) — حالت تست':'🟡 USDT (BEP20) — خودکار',callback_data:`pay:crypto:BEP20:${token}`}]);if(cfg.trc20)rows.push([{text:'🔴 USDT (TRC20) — خودکار',callback_data:`pay:crypto:TRC20:${token}`}]);if(cfg.ton&&cfg.tonRate>0)rows.push([{text:'💎 TON — خودکار',callback_data:`pay:crypto:TON:${token}`}]);}
   if(await featureEnabled(env,'feature_card',true)&&cfg.card)rows.push([{text:'🏦 کارت به کارت — تأیید دستی',callback_data:`pay:card:${token}`}]);
-  rows.push([{text:'⬅️ بازگشت',callback_data:'credit:buy'}]);
+  rows.push([{text:'⬅️ بازگشت',callback_data:backData}]);
   await edit(env,chat,mid,`💳 <b>انتخاب روش پرداخت</b>\n\n💵 ارزش دلاری شارژ: <b>$${usd.toFixed(2)} USD</b>\n💎 اعتبار اضافه‌شونده: <b>${credits.toFixed(2)} Credit</b>\n\nروش پرداخت را انتخاب کن. مبلغ نهایی شبکه یا کارت در فاکتور نمایش داده می‌شود.`,rows);
 }
 async function createCryptoInvoice(env:Env,uid:number,usd:number,credits:number,network:string){
@@ -1249,7 +1249,7 @@ async function handleCallback(env:Env,c:CallbackQuery){
   if(d==='balance')return showBalance(env,uid,chat,mid);
   if(d==='credit:buy')return showCreditPackages(env,chat,mid);
   if(d==='credit:custom'){await env.DB.prepare("UPDATE users SET state='await_custom_credit' WHERE telegram_id=?").bind(uid).run();return edit(env,chat,mid,'✏️ مبلغ دلخواه را به دلار وارد کن.\nمثال: <code>27</code>',[[{text:'⬅️ بازگشت',callback_data:'credit:buy'}]]);}
-  if(d.startsWith('credit:need:')){const x=d.split(':');const pid=Number(x[2]),qty=Number(x[3]),did=Number(x[4]||0);const p:any=await productWithMeta(env,pid);if(!p)return;const subtotal=Number(p.price_credits)*qty,disc=await validDiscount(env,did,subtotal),total=subtotal-discountAmount(disc,subtotal),b=await balance(env,uid),need=Math.max(0,total-b.total);if(need<=0)return showOrderSummary(env,uid,chat,mid,pid,qty,did);const usd=need*Number(env.CREDIT_USD_PRICE||1);return paymentMethods(env,chat,mid,usd,need);}
+  if(d.startsWith('credit:need:')){const x=d.split(':');const pid=Number(x[2]),qty=Number(x[3]),did=Number(x[4]||0);const p:any=await productWithMeta(env,pid);if(!p)return;const subtotal=Number(p.price_credits)*qty,disc=await validDiscount(env,did,subtotal),total=subtotal-discountAmount(disc,subtotal),b=await balance(env,uid),need=Math.max(0,total-b.total);if(need<=0)return showOrderSummary(env,uid,chat,mid,pid,qty,did);const usd=need*Number(env.CREDIT_USD_PRICE||1);return paymentMethods(env,chat,mid,usd,need,`shop:summary:${pid}:${qty}:${did}`);}
   if(d.startsWith('credit:customneed:')){const x=d.split(':');await env.DB.prepare('UPDATE users SET state=? WHERE telegram_id=?').bind(`await_custom_credit_return:${x[2]}:${x[3]}:${x[4]||0}`,uid).run();return edit(env,chat,mid,'✏️ مقدار Credit دلخواه برای شارژ را وارد کن.\nمثال: <code>5</code>',[[{text:'⬅️ سفارش',callback_data:`shop:summary:${x[2]}:${x[3]}:${x[4]||0}`}]]);}
   if(d.startsWith('credit:quick:')){const usd=Number(d.split(':')[2]);const credits=usd/Number(env.CREDIT_USD_PRICE||1);return paymentMethods(env,chat,mid,usd,credits);}
   if(d.startsWith('credit:pkg:')){const id=Number(d.split(':')[2]); const p:any=await env.DB.prepare('SELECT * FROM credit_packages WHERE id=? AND enabled=1').bind(id).first(); if(p)return paymentMethods(env,chat,mid,Number(p.pay_usd),Number(p.credits));}
