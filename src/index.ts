@@ -1464,7 +1464,7 @@ function webBroadcastPreview(text:string){
   return s.replace(/\n/g,'<br>');
 }
 async function validAdminSession(req:Request,env:Env){
-  if((!env.ADMIN_WEB_PASSWORD&&!webAdminAccounts(env).length)||!env.ADMIN_SESSION_SECRET)return null; const token=cookieValue(req,'nexora_admin'); if(!token)return null; const hash=await sha256Hex(token); const row:any=await env.DB.prepare("SELECT * FROM admin_sessions WHERE token_hash=? AND datetime(expires_at)>datetime('now')").bind(hash).first();return row||null;
+  if((!env.ADMIN_WEB_PASSWORD&&!String(env.ADMIN_WEB_USERS||'').trim())||!env.ADMIN_SESSION_SECRET||(String(env.ADMIN_WEB_USERS||'').trim()&&!webAdminAccounts(env).length))return null; const token=cookieValue(req,'nexora_admin'); if(!token)return null; const hash=await sha256Hex(token); const row:any=await env.DB.prepare("SELECT * FROM admin_sessions WHERE token_hash=? AND datetime(expires_at)>datetime('now')").bind(hash).first();return row||null;
 }
 async function revokeAdminSession(req:Request,env:Env){const token=cookieValue(req,'nexora_admin');if(token)await env.DB.prepare('DELETE FROM admin_sessions WHERE token_hash=?').bind(await sha256Hex(token)).run();}
 function injectCsrf(body:string,csrf:string){return body.replace(/(<form\b[^>]*method=["']post["'][^>]*>)/gi,`$1<input type="hidden" name="csrf" value="${webEsc(csrf)}">`);}
@@ -1622,7 +1622,7 @@ async function exportAdminData(env:Env,type:string){const allowed=new Set(['user
 
 async function handleWebAdmin(req:Request,env:Env,url:URL):Promise<Response|null>{
   if(!url.pathname.startsWith('/admin-web'))return null;
-  if((!env.ADMIN_WEB_PASSWORD&&!webAdminAccounts(env).length)||!env.ADMIN_SESSION_SECRET)return new Response('ADMIN_WEB_PASSWORD یا ADMIN_WEB_USERS و ADMIN_SESSION_SECRET را تنظیم کنید.',{status:503});
+  if((!env.ADMIN_WEB_PASSWORD&&!String(env.ADMIN_WEB_USERS||'').trim())||!env.ADMIN_SESSION_SECRET)return new Response('ADMIN_WEB_PASSWORD یا ADMIN_WEB_USERS و ADMIN_SESSION_SECRET را تنظیم کنید.',{status:503});if(String(env.ADMIN_WEB_USERS||'').trim()&&!webAdminAccounts(env).length)return new Response('ADMIN_WEB_USERS تنظیم شده اما JSON یا حساب‌های آن معتبر نیستند.',{status:503});
   if(url.pathname==='/admin-web/receipt'){
     const session:any=await validAdminSession(req,env);if(!session)return loginPage();
     const pub=String(url.searchParams.get('invoice')||'').trim();if(!pub||pub.length>80)return new Response('شناسه فاکتور معتبر نیست.',{status:400});
@@ -1638,7 +1638,7 @@ async function handleWebAdmin(req:Request,env:Env,url:URL):Promise<Response|null
     if(action==='login'){
       if(await isLoginBlocked(req,env))return loginPage('تلاش‌های ناموفق زیادی ثبت شده. ۳۰ دقیقه بعد دوباره امتحان کن.');
       const accounts=webAdminAccounts(env);let identity={telegram_id:0,username:''};let authenticated=false;
-      if(accounts.length){const username=String(fd.get('username')||'').trim();const password=String(fd.get('password')||'');const account=accounts.find((x)=>x.username===username);if(account&&safeEq(await sha256Hex(password),await sha256Hex(account.password))){identity={telegram_id:account.telegram_id,username:account.username};authenticated=true;}}
+      if(String(env.ADMIN_WEB_USERS||'').trim()){const username=String(fd.get('username')||'').trim();const password=String(fd.get('password')||'');const account=accounts.find((x)=>x.username===username);if(account&&safeEq(await sha256Hex(password),await sha256Hex(account.password))){identity={telegram_id:account.telegram_id,username:account.username};authenticated=true;}}
       else {const got=await sha256Hex(String(fd.get('password')||'')),expected=await sha256Hex(env.ADMIN_WEB_PASSWORD||'');authenticated=safeEq(got,expected);}
       if(!authenticated){await recordLoginFailure(req,env);return loginPage('نام کاربری یا رمز اشتباه است.');}
       await clearLoginFailures(req,env);const session=await makeAdminSession(req,env,identity.telegram_id,identity.username);return new Response(null,{status:303,headers:{location:'/admin-web','set-cookie':`nexora_admin=${encodeURIComponent(session.token)}; Path=/admin-web; Max-Age=43200; HttpOnly; Secure; SameSite=Strict`}});
