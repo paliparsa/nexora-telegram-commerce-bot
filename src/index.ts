@@ -673,14 +673,17 @@ async function showProduct(env:Env,chat:number,mid:number,pid:number){
   if(!p||!p.enabled||(String(p.source_type||'local')==='provider'&&!(await featureEnabled(env,'feature_provider_products',true))))return edit(env,chat,mid,'❌ محصول پیدا نشد.',[[{text:'⬅️ فروشگاه',callback_data:'shop:list'}]]);
   const fav:any=await env.DB.prepare('SELECT 1 x FROM user_favorites WHERE telegram_id=? AND product_id=?').bind(chat,pid).first();
   const mode=String(p.delivery_mode||'stock');const showStock=await featureEnabled(env,'show_stock_to_users',true);
-  let t=`${p.category_emoji||'🛍'} <b>${esc(p.title)}</b>\n\n${esc(p.description||'')}\n\n💎 قیمت: <b>${Number(p.price_credits).toFixed(2)} Credit</b>\n📦 نوع تحویل: <b>${esc(deliveryLabel(p))}</b>`;
-  if(showStock&&mode!=='manual')t+=`\n📊 موجودی: <b>${p.stock}</b>`;if(mode==='manual')t+='\n⏳ وضعیت تحویل: <b>دستی توسط ادمین</b>';
-  if(p.delivery_eta)t+=`\n⏱ زمان تحویل: <b>${esc(p.delivery_eta)}</b>`;if(p.warranty_text)t+=`\n🛡 ضمانت: <b>${esc(p.warranty_text)}</b>`; if(p.format_text)t+=`\n📋 فرمت تحویل: <b>${esc(p.format_text)}</b>`;
-  const min=Math.max(1,Number(p.min_qty||1)),max=Math.max(min,Number(p.max_qty||10));const available=mode==='manual'?max:Number(p.stock||0);
-  const candidates=[1,2,3,5,10].filter(x=>x>=min&&x<=available);if(min<=available&&!candidates.includes(min))candidates.unshift(min);
-  const rows:Btn[][]=[]; if(candidates.length)rows.push(candidates.slice(0,5).map(q=>({text:String(q),callback_data:`shop:summary:${p.id}:${q}:0`})));
-  if(available>=min)rows.push([{text:'✏️ وارد کردن تعداد دلخواه',callback_data:`shop:qty:${p.id}`}]);
-  if(!candidates.length&&mode!=='manual'&&await featureEnabled(env,'feature_restock_watch',true))rows.push([{text:'🔔 وقتی موجود شد خبرم کن',callback_data:`shop:watch:${p.id}`}]);
+  const min=Math.max(1,Number(p.min_qty||1)),max=Math.max(min,Number(p.max_qty||10));const available=mode==='manual'?max:Number(p.stock||0);const canBuy=available>=min;
+  let t=`${p.category_emoji||'🛍'} <b>${esc(p.title)}</b>\n💎 قیمت: <b>${Number(p.price_credits).toFixed(2)} Credit</b>`;
+  t+=`\n\n📦 <b>وضعیت و تحویل</b>\n🚚 نوع تحویل: <b>${esc(deliveryLabel(p))}</b>`;
+  if(mode==='manual')t+='\n⏳ وضعیت تحویل: <b>دستی توسط ادمین</b>';
+  if(mode!=='manual'){if(available<=0)t+='\n📊 وضعیت موجودی: <b>ناموجود</b>';else if(showStock)t+=`\n📊 موجودی: <b>${available}</b>`;else t+='\n📊 وضعیت موجودی: <b>قابل سفارش</b>';}
+  if(p.delivery_eta)t+=`\n⏱ زمان تحویل: <b>${esc(p.delivery_eta)}</b>`;
+  if(p.warranty_text||p.format_text||p.description){t+='\n\nℹ️ <b>جزئیات محصول</b>';if(p.warranty_text)t+=`\n🛡 ضمانت: <b>${esc(p.warranty_text)}</b>`;if(p.format_text)t+=`\n📋 فرمت تحویل: <b>${esc(p.format_text)}</b>`;if(p.description)t+=`\n\n${esc(p.description)}`;}
+  const candidates=[1,2,3,5,10].filter(x=>x>=min&&x<=available);if(canBuy&&!candidates.includes(min))candidates.unshift(min);
+  const rows:Btn[][]=[];
+  if(canBuy){rows.push(candidates.slice(0,5).map(q=>({text:`🛒 ${q} عدد`,callback_data:`shop:summary:${p.id}:${q}:0`})));rows.push([{text:'✏️ وارد کردن تعداد دلخواه',callback_data:`shop:qty:${p.id}`}]);}
+  else if(mode!=='manual'){t+='\n\n⚠️ <b>این محصول فعلاً قابل خرید نیست.</b>\nمی‌توانی درخواست اطلاع‌رسانی ثبت کنی تا پس از موجودشدن خبرت کنیم.';if(await featureEnabled(env,'feature_restock_watch',true))rows.push([{text:'🔔 اطلاع‌رسانی هنگام موجودشدن',callback_data:`shop:watch:${p.id}`}]);else t+='\nامکان اعلان موجودی برای این محصول در حال حاضر غیرفعال است.';}
   if(await featureEnabled(env,'feature_favorites',true))rows.push([{text:fav?'★ حذف از علاقه‌مندی':'☆ افزودن به علاقه‌مندی',callback_data:`shop:fav:${p.id}`}]);
   rows.push([{text:'⬅️ بازگشت',callback_data:p.category_id?`shop:cat:${p.category_id}:0`:'shop:list'}]); await edit(env,chat,mid,t,rows);
 }
@@ -693,8 +696,8 @@ async function showOrderSummary(env:Env,uid:number,chat:number,mid:number,pid:nu
   const access=await getUserAccess(env,uid);let p:any=await productWithMeta(env,pid);if(!p||!p.enabled||(String(p.source_type||'local')==='provider'&&!(await featureEnabled(env,'feature_provider_products',true))))return edit(env,chat,mid,'❌ محصول در دسترس نیست.',[[{text:'⬅️ فروشگاه',callback_data:'shop:list'}]]);if(String(p.source_type||'local')==='provider'&&p.provider_product_id){await refreshProviderProduct(env,Number(p.provider_product_id));p=await productWithMeta(env,pid);if(!p||!p.enabled)return edit(env,chat,mid,'❌ محصول در دسترس نیست.',[[{text:'⬅️ فروشگاه',callback_data:'shop:list'}]]);}
   const min=Math.max(1,Number(p.min_qty||1)),max=Math.max(min,Number(p.max_qty||10)),mode=String(p.delivery_mode||'stock'),allowedMax=mode==='manual'?max:Number(p.stock||0);if(!Number.isInteger(qty)||qty<min||qty>allowedMax)return edit(env,chat,mid,'❌ تعداد یا موجودی محصول معتبر نیست.',[[{text:'⬅️ محصول',callback_data:`shop:p:${pid}`}]]);
   const subtotal=Number(p.price_credits)*qty; const d=await validDiscount(env,discountId,subtotal); const off=discountAmount(d,subtotal); const total=subtotal-off;if(access.purchase_limit!==null&&access.purchase_limit!==undefined&&Number(access.purchase_limit)>0&&total>Number(access.purchase_limit))return edit(env,chat,mid,`⛔ سقف خرید حساب شما <b>${Number(access.purchase_limit).toFixed(2)} Credit</b> است.`); const b=await balance(env,uid);
-  let t=`🛒 <b>خلاصهٔ سفارش</b>\n\n📦 محصول: <b>${esc(p.title)}</b>\n🔢 تعداد: <b>${qty}</b>\n🚚 روش تحویل: <b>${esc(deliveryLabel(p))}</b>${p.delivery_eta?`\n⏱ زمان تقریبی تحویل: <b>${esc(p.delivery_eta)}</b>`:''}\n\n💰 <b>مبلغ نهایی: ${total.toFixed(2)} Credit</b>\n📊 موجودی فعلی: <b>${b.total.toFixed(2)} Credit</b>`;
-  if(subtotal!==total)t+=`\n🧾 مبلغ قبل از تخفیف: ${subtotal.toFixed(2)} Credit`;if(d)t+=`\n🏷 کد تخفیف: <b>${esc(d.code)}</b>\n➖ مقدار تخفیف: <b>${off.toFixed(2)} Credit</b>`;if(p.warranty_text)t+=`\n🛡 ضمانت: <b>${esc(p.warranty_text)}</b>`;
+  let t=`🛒 <b>خلاصهٔ سفارش</b>\n\n📦 محصول: <b>${esc(p.title)}</b>\n💎 قیمت هر عدد: <b>${Number(p.price_credits).toFixed(2)} Credit</b>\n🔢 تعداد: <b>${qty}</b>\n🚚 نوع تحویل: <b>${esc(deliveryLabel(p))}</b>${p.delivery_eta?`\n⏱ زمان تحویل: <b>${esc(p.delivery_eta)}</b>`:''}\n📦 وضعیت: <b>${mode==='manual'?'تحویل دستی':Number(p.stock||0)>0?'موجود':'ناموجود'}</b>${p.warranty_text?`\n🛡 ضمانت: <b>${esc(p.warranty_text)}</b>`:''}\n\n💰 <b>مبلغ نهایی: ${total.toFixed(2)} Credit</b>\n💳 اعتبار فعلی: <b>${b.total.toFixed(2)} Credit</b>`;
+  if(subtotal!==total)t+=`\n🧾 مبلغ قبل از تخفیف: ${subtotal.toFixed(2)} Credit`;if(d)t+=`\n🏷 کد تخفیف: <b>${esc(d.code)}</b>\n➖ مقدار تخفیف: <b>${off.toFixed(2)} Credit</b>`;if(p.format_text)t+=`\n📋 فرمت تحویل: <b>${esc(p.format_text)}</b>`;
   const rows:Btn[][]=[[{text:'🏷 وارد کردن کد تخفیف',callback_data:`shop:discount:${pid}:${qty}`}]];
   if(b.total+1e-9>=total)rows.push([{text:'✅ تأیید و پرداخت',callback_data:`shop:buy:${pid}:${qty}:${d?.id||0}`}]);
   else{const need=Math.max(0,total-b.total);t+=`\n\n⚠️ <b>اعتبار کافی نیست</b>\nبرای تکمیل این سفارش، <b>${need.toFixed(2)} Credit</b> دیگر نیاز داری.`;rows.push([{text:`💳 شارژ کسری ${need.toFixed(2)} Credit`,callback_data:`credit:need:${pid}:${qty}:${d?.id||0}`}],[{text:'✏️ انتخاب مبلغ شارژ',callback_data:`credit:customneed:${pid}:${qty}:${d?.id||0}`}]);}
