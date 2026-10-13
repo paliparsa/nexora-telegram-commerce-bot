@@ -1575,39 +1575,52 @@ function setupWebhookPage(msg=''){return new Response(`<!doctype html><html lang
 export default {
   async fetch(req:Request,env:Env):Promise<Response>{
     const url=new URL(req.url);
-    const webAdmin=await handleWebAdmin(req,env,url); if(webAdmin)return webAdmin;
-    if(url.pathname==='/health')return j({ok:true});
-    if(url.pathname==='/webhook'){
-      if(req.method!=='POST')return new Response('method not allowed',{status:405,headers:{allow:'POST'}});
-      if(!env.WEBHOOK_SECRET||env.WEBHOOK_SECRET.length<16)return new Response('webhook secret is not configured',{status:503});
-      const got=req.headers.get('X-Telegram-Bot-Api-Secret-Token')||'';if(!safeEq(got,env.WEBHOOK_SECRET))return new Response('forbidden',{status:403});
-      const len=Number(req.headers.get('content-length')||0);if(len>1024*1024)return new Response('payload too large',{status:413});
-      let u:Update;try{u=await req.json() as Update;}catch{return new Response('bad request',{status:400});}await handleUpdate(env,u); return j({ok:true});
+    const requestId=(req.headers.get('cf-ray')||'').split('-')[0]||crypto.randomUUID();
+    try {
+      const webAdmin=await handleWebAdmin(req,env,url); if(webAdmin)return webAdmin;
+      if(url.pathname==='/health')return j({ok:true});
+      if(url.pathname==='/webhook'){
+        if(req.method!=='POST')return new Response('method not allowed',{status:405,headers:{allow:'POST'}});
+        if(!env.WEBHOOK_SECRET||env.WEBHOOK_SECRET.length<16)return new Response('webhook secret is not configured',{status:503});
+        const got=req.headers.get('X-Telegram-Bot-Api-Secret-Token')||'';if(!safeEq(got,env.WEBHOOK_SECRET))return new Response('forbidden',{status:403});
+        const len=Number(req.headers.get('content-length')||0);if(len>1024*1024)return new Response('payload too large',{status:413});
+        let u:Update;try{u=await req.json() as Update;}catch{return new Response('bad request',{status:400});}await handleUpdate(env,u); return j({ok:true});
+      }
+      if(url.pathname==='/setup-webhook'){
+        if(req.method==='GET')return setupWebhookPage();
+        if(req.method!=='POST')return new Response('method not allowed',{status:405,headers:{allow:'GET, POST'}});
+        if(!env.SETUP_SECRET||env.SETUP_SECRET.length<16)return new Response('SETUP_SECRET is not configured',{status:503});
+        if(!env.WEBHOOK_SECRET||env.WEBHOOK_SECRET.length<16)return new Response('WEBHOOK_SECRET is not configured',{status:503});
+        // The high-entropy setup secret is submitted in the POST body, never in the URL.
+        const ct=req.headers.get('content-type')||'';let supplied='';if(ct.includes('application/json')){try{supplied=String((await req.json() as any)?.secret||'');}catch{}}else{try{supplied=String((await req.formData()).get('secret')||'');}catch{}}
+        const a=await sha256Hex(supplied),b=await sha256Hex(env.SETUP_SECRET);if(!safeEq(a,b))return setupWebhookPage('Secret صحیح نیست.');
+        let base:URL;try{base=new URL(env.PUBLIC_BASE_URL);}catch{return new Response('PUBLIC_BASE_URL is invalid',{status:500});}if(base.protocol!=='https:'||/YOUR-|example/i.test(base.hostname))return new Response('PUBLIC_BASE_URL must be a real HTTPS address',{status:500});
+        const target=`${base.origin}${base.pathname.replace(/\/$/,'')}/webhook`; const body:any={url:target,drop_pending_updates:false,secret_token:env.WEBHOOK_SECRET}; const r=await tg(env,'setWebhook',body); return j(r,r.ok?200:502);
+      }
+      return new Response('Nexora Commerce Bot Worker',{headers:{'cache-control':'no-store'}});
+    } catch(error:any) {
+      const detail=String(error?.stack||error?.message||error||'unknown_error').slice(0,5000);
+      console.error(JSON.stringify({event:'worker_fetch_exception',requestId,path:url.pathname,method:req.method,error:detail}));
+      if(url.pathname==='/webhook')return j({ok:false,error:'temporarily_unavailable',request_id:requestId},500);
+      if(url.pathname.startsWith('/admin-web')||url.pathname.startsWith('/setup-webhook'))return new Response(`<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>خطای موقت</title><body style="font-family:system-ui;max-width:640px;margin:12vh auto;padding:24px;color:#172033"><h2>در حال حاضر انجام این درخواست ممکن نیست</h2><p>خطا ثبت شد و می‌توانی دوباره تلاش کنی. اگر ادامه داشت، شناسه زیر را برای پشتیبانی بفرست.</p><code>${requestId}</code><p><a href="/admin-web">بازگشت به پنل</a></p></body></html>`,{status:500,headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-request-id':requestId,'x-content-type-options':'nosniff'}});
+      return new Response('درخواست موقتاً انجام نشد. لطفاً دوباره تلاش کنید.',{status:500,headers:{'cache-control':'no-store','x-request-id':requestId,'content-type':'text/plain; charset=utf-8'}});
     }
-    if(url.pathname==='/setup-webhook'){
-      if(req.method==='GET')return setupWebhookPage();
-      if(req.method!=='POST')return new Response('method not allowed',{status:405,headers:{allow:'GET, POST'}});
-      if(!env.SETUP_SECRET||env.SETUP_SECRET.length<16)return new Response('SETUP_SECRET is not configured',{status:503});
-      if(!env.WEBHOOK_SECRET||env.WEBHOOK_SECRET.length<16)return new Response('WEBHOOK_SECRET is not configured',{status:503});
-      // Do not gate webhook setup on Origin/Sec-Fetch-Site. With custom domains,
-      // routes and reverse proxies those headers can legitimately differ. This
-      // endpoint is protected by a high-entropy SETUP_SECRET supplied only in the
-      // POST body, so a cross-site request without that secret cannot configure it.
-      const ct=req.headers.get('content-type')||'';let supplied='';if(ct.includes('application/json')){try{supplied=String((await req.json() as any)?.secret||'');}catch{}}else{try{supplied=String((await req.formData()).get('secret')||'');}catch{}}
-      const a=await sha256Hex(supplied),b=await sha256Hex(env.SETUP_SECRET);if(!safeEq(a,b))return setupWebhookPage('Secret صحیح نیست.');
-      let base:URL;try{base=new URL(env.PUBLIC_BASE_URL);}catch{return new Response('PUBLIC_BASE_URL is invalid',{status:500});}if(base.protocol!=='https:'||/YOUR-|example/i.test(base.hostname))return new Response('PUBLIC_BASE_URL must be a real HTTPS address',{status:500});
-      const target=`${base.origin}${base.pathname.replace(/\/$/,'')}/webhook`; const body:any={url:target,drop_pending_updates:false,secret_token:env.WEBHOOK_SECRET}; const r=await tg(env,'setWebhook',body); return j(r,r.ok?200:502);
-    }
-    return new Response('Nexora Commerce Bot Worker',{headers:{'cache-control':'no-store'}});
   },
   async scheduled(_controller:ScheduledController,env:Env,ctx:ExecutionContext){
     ctx.waitUntil((async()=>{
-      await env.DB.batch([
+      const runTask=async(name:string,job:()=>Promise<unknown>)=>{try{await job();}catch(error:any){console.error(JSON.stringify({event:'worker_scheduled_exception',task:name,error:String(error?.stack||error?.message||error||'unknown_error').slice(0,5000)}));}};
+      await runTask('maintenance_cleanup',async()=>env.DB.batch([
         env.DB.prepare("UPDATE payment_invoices SET status='expired' WHERE status IN ('pending','awaiting_receipt') AND datetime(expires_at)<=datetime('now')"),
         env.DB.prepare("DELETE FROM admin_sessions WHERE datetime(expires_at)<=datetime('now')"),
         env.DB.prepare("DELETE FROM admin_login_attempts WHERE datetime(updated_at)<=datetime('now','-2 days')")
-      ]);
-      await migratePlainStock(env); await refreshRates(env); await scanPendingCrypto(env); await setSetting(env,'scanner_last_run',nowIso()); await syncAllProviders(env); await pollProviderOrders(env); await processBroadcasts(env);
+      ]));
+      await runTask('migrate_plain_stock',()=>migratePlainStock(env));
+      await runTask('refresh_rates',()=>refreshRates(env));
+      await runTask('scan_pending_crypto',()=>scanPendingCrypto(env));
+      await runTask('scanner_last_run',()=>setSetting(env,'scanner_last_run',nowIso()));
+      await runTask('sync_all_providers',()=>syncAllProviders(env));
+      await runTask('poll_provider_orders',()=>pollProviderOrders(env));
+      await runTask('process_broadcasts',()=>processBroadcasts(env));
     })());
   }
 };
